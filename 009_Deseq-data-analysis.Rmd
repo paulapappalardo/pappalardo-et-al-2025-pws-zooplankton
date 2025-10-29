@@ -1,0 +1,410 @@
+---
+title: "Deseq data analysis"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+
+```{r markdown setup}
+library(knitr)
+
+# tidy options
+
+knitr::opts_chunk$set(echo = T, eval= F, warning = F, message = F, comment = "",
+                      tidy.opts = list(width.cutoff = 55), tidy = TRUE)
+```
+
+# Overview
+
+We used the DESeq2 package for zooplankton differential abundance analysis.  DESeq expects count data (number of reads), with independent biological samples as columns, and the entities to compare as rows. This information is usually from different genes in RNA seq data, but can be different taxonomic groups for ecological comparisons. These are some tutorials we consulted:
+
+* https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html: main general tutorial
+* https://joey711.github.io/phyloseq-extensions/DESeq2.html: tutorial specific for phyloseq data
+* https://hbctraining.github.io/DGE_workshop_salmon_online/lessons/05b_wald_test_results.html: this is one is very detailed about how to set up the contrast and understanding results
+
+```{r if needed}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("DESeq2")
+```
+
+
+```{r setup}
+library(DESeq2)
+library(phyloseq)
+library(dplyr)
+library(ggplot2)
+library(microshades)
+
+
+packageVersion("DESeq2")
+
+# source functions we need
+source("007a_Summarizing-data_functions.R") 
+source("008a_Phyloseq-data-analysis_functions.R")
+source("009a_Deseq-data-analysis_functions.R")
+
+```
+
+## Time of sampling
+
+```{r season - all locations}
+# load dataset for each location----
+load("results/pws_con.R")
+load("results/pws_vmt.R")
+load("results/pws_vdz.R")
+
+# # Check to see if I can fix any more plankton groups currently classified as "CHECK"
+# con_df <- speedyseq::psmelt(pws_con) %>% 
+#   addPlanktonGroup_When()
+# vdz_df <- speedyseq::psmelt(pws_vdz) %>% 
+#   addPlanktonGroup_When()
+# vmt_df <- speedyseq::psmelt(pws_vmt) %>% 
+#   addPlanktonGroup_When()
+# 
+# View(con_df %>% filter(plankton_group == "CHECK") %>% distinct(phylum, class, order, family, genus, species, plankton_group))
+# View(vdz_df %>% filter(plankton_group == "CHECK") %>% distinct(phylum, class, order, family, genus, species, plankton_group))
+# View(vmt_df %>% filter(plankton_group == "CHECK") %>% distinct(phylum, class, order, family, genus, species, plankton_group))
+
+# Setup data we need----
+# CON
+# aggregate by plankton group
+con_sciname <- pws_con %>% 
+  addPlanktonGroupToTaxTable() %>%
+  phyloseq::subset_taxa(., plankton_group != "CHECK") %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>%
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  microbiome::aggregate_taxa(level = "plankton_group") 
+# convert to dataframe to check things
+pws_con_df <- speedyseq::psmelt(con_sciname) 
+
+# VDZ
+# aggregate by plankton group
+vdz_sciname <- pws_vdz %>% 
+  addPlanktonGroupToTaxTable() %>%
+  phyloseq::subset_taxa(., plankton_group != "CHECK") %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>%
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>%
+  microbiome::aggregate_taxa(level = "plankton_group") 
+# convert to dataframe to check things
+pws_vdz_df <- speedyseq::psmelt(vdz_sciname) 
+
+# VMT
+# aggregate by plankton group
+vmt_sciname <- pws_vmt %>% 
+  addPlanktonGroupToTaxTable() %>% 
+  phyloseq::subset_taxa(., plankton_group != "CHECK") %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>%
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>%
+  microbiome::aggregate_taxa(level = "plankton_group") 
+# convert to dataframe to check things
+pws_vmt_df <- speedyseq::psmelt(vmt_sciname) 
+
+# Ran DESeq----
+# create your deseq object indicating your factor
+month_con <- phyloseq_to_deseq2(con_sciname, ~ month)
+month_con <- DESeq(month_con, test = "Wald", fitType = "parametric")
+
+month_vdz <- phyloseq_to_deseq2(vdz_sciname, ~ month)
+# Check the number of rows (genes) before filtering
+nrow(month_vdz)
+
+# Filter out low-count genes
+# This keeps only genes with a total count of 10 or more across all samples
+# keep <- rowSums(counts(month_vdz)) >= 10
+# month_vdz <- month_vdz[keep,]
+# that still did not help to make the fitType = parametric or local to work, we had to use "mean"
+month_vdz  <- DESeq2::DESeq(month_vdz , test = "Wald", fitType = "mean")
+
+
+month_vmt <- phyloseq_to_deseq2(vmt_sciname, ~ month)
+month_vmt <- DESeq(month_vmt, test = "Wald", fitType = "parametric")
+
+# CON-----
+# set up contrasts for clarity and run results
+res_AprVsMay <- results(month_con, contrast = c("month", "April", "May"))
+res_AprVsJun <- results(month_con, contrast = c("month", "April", "June"))
+res_MayVsJun <- results(month_con, contrast = c("month", "May", "June"))
+res_JunVsJul <- results(month_con, contrast = c("month", "June", "July"))
+
+# get significant table if any
+res_sig_AprVsMay <- getSignficantOnly(res_AprVsMay, con_sciname)
+res_sig_AprVsJun <- getSignficantOnly(res_AprVsJun, con_sciname)
+res_sig_MayVsJun <- getSignficantOnly(res_MayVsJun, con_sciname)
+res_sig_JunVsJul <- getSignficantOnly(res_JunVsJul, con_sciname)
+
+
+# make a dataframe to plot log fold change
+Apr_vs_May <- res_sig_AprVsMay %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Apr_vs_May")  
+May_vs_Jun <- res_sig_AprVsJun %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "May_vs_Jun")  
+Apr_vs_Jun <- res_sig_MayVsJun %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Apr_vs_Jun")  
+
+data_melted_con <- Apr_vs_May %>%
+  bind_rows(May_vs_Jun, Apr_vs_Jun) %>% 
+  mutate(location = "CON")
+
+# VDZ-----
+# set up contrasts for clarity and run results
+vdz_AprVsMay <- results(month_vdz, contrast = c("month", "April", "May"))
+vdz_AprVsJun <- results(month_vdz, contrast = c("month", "April", "June"))
+vdz_MayVsJun <- results(month_vdz, contrast = c("month", "May", "June"))
+vdz_JunVsJul <- results(month_vdz, contrast = c("month", "June", "July"))
+vdz_JulVsAug <- results(month_vdz, contrast = c("month", "July", "August"))
+
+# get significant table if any
+vdz_sig_AprVsMay <- getSignficantOnly(vdz_AprVsMay, vdz_sciname)
+vdz_sig_AprVsJun <- getSignficantOnly(vdz_AprVsJun, vdz_sciname)
+vdz_sig_MayVsJun <- getSignficantOnly(vdz_MayVsJun, vdz_sciname)
+vdz_sig_JunVsJul <- getSignficantOnly(vdz_JunVsJul, vdz_sciname)
+vdz_sig_JulVsAug <- getSignficantOnly(vdz_JulVsAug, vdz_sciname)
+
+# make a dataframe to plot log fold change
+#Apr_vs_May <- vdz_sig_AprVsMay %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Apr_vs_May")  
+May_vs_Jun <- vdz_sig_AprVsJun %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "May_vs_Jun")  
+Apr_vs_Jun <- vdz_sig_MayVsJun %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Apr_vs_Jun")  
+Jun_vs_Jul <- vdz_sig_JunVsJul %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Jun_vs_Jul")  
+
+data_melted_vdz <- May_vs_Jun %>%
+  bind_rows(Apr_vs_Jun, Jun_vs_Jul) %>% 
+  mutate(location = "VDZ")
+
+# VMT-----
+# set up contrasts for clarity and run results
+vmt_AprVsMay <- results(month_vmt, contrast = c("month", "April", "May"))
+vmt_AprVsJun <- results(month_vmt, contrast = c("month", "April", "June"))
+vmt_MayVsJun <- results(month_vmt, contrast = c("month", "May", "June"))
+vmt_JunVsJul <- results(month_vmt, contrast = c("month", "June", "July"))
+vmt_JulVsAug <- results(month_vmt, contrast = c("month", "July", "August"))
+
+# get significant table if any
+vmt_sig_AprVsMay <- getSignficantOnly(vmt_AprVsMay, vmt_sciname)
+vmt_sig_AprVsJun <- getSignficantOnly(vmt_AprVsJun, vmt_sciname)
+vmt_sig_MayVsJun <- getSignficantOnly(vmt_MayVsJun, vmt_sciname)
+vmt_sig_JunVsJul <- getSignficantOnly(vmt_JunVsJul, vmt_sciname)
+vmt_sig_JulVsAug <- getSignficantOnly(vmt_JulVsAug, vmt_sciname)
+
+# make a dataframe to plot log fold change
+#Apr_vs_May <- vmt_sig_AprVsMay %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Apr_vs_May")  
+May_vs_Jun <- vmt_sig_AprVsJun %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "May_vs_Jun")  
+Apr_vs_Jun <- vmt_sig_MayVsJun %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Apr_vs_Jun")  
+#Jun_vs_Jul <- vmt_sig_JunVsJul %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Jun_vs_Jul")  
+
+data_melted_vmt <- May_vs_Jun %>%
+  bind_rows(Apr_vs_Jun) %>% 
+  mutate(location = "VMT")
+
+# Combine and plot
+all_melted <- data_melted_con %>%
+  bind_rows(data_melted_vdz, data_melted_vmt) %>% 
+  mutate(f_contrast = factor(contrast, levels = c("Apr_vs_May", "Apr_vs_Jun", "May_vs_Jun", "Jun_vs_Jul"), ordered = T))
+
+# color palette to add benthic and keep colors constant
+custom_plankton <- c("Holoplankton" =  "#999999",
+                     "Meroplankton" =  "#E69F00",
+                     "Benthic" =   "#009E73")
+   
+diffab_months <- ggplot(all_melted, aes(x = f_contrast, y = log2FoldChange, fill = plankton_group)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  labs(title = '', x = 'Taxa', y = 'log2 Fold Change') +
+  scale_fill_manual(values = custom_plankton, name = "") +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'gray') +
+  facet_grid(location ~ f_contrast, scales= "free_x") +
+  niceplot
+
+# save figure as pdf
+ggsave("figures/FigS2_diff_ab_month_location_updated.pdf", diffab_months  , height = 7, width = 8, dpi = 300)
+```
+
+
+## Location
+
+```{r location - metazoans only}
+# load dataset for day vs night
+load("results/pws_allthree.R")
+
+location_sciname <- pws_allthree %>% 
+  microbiome::aggregate_taxa(level = "sciname") 
+
+# convert to dataframe to check things
+pws_location_df <- speedyseq::psmelt(location_sciname)
+
+# create your deseq object indicating your factor
+location <- phyloseq_to_deseq2(location_sciname, ~ location)
+location <- DESeq(location, test = "Wald", fitType = "parametric")
+
+# set up contrasts for clarity and run results
+res_con_vs_vdz <- results(location, contrast = c("location", "CON", "VDZ"))
+res_con_vs_vmt <- results(location, contrast = c("location", "CON", "VMT"))
+res_vmt_vs_vdz <- results(location, contrast = c("location", "VMT", "VDZ"))
+
+# get significant table if any
+res_sig_con_vs_vdz <- getSignficantOnly(res_con_vs_vdz, location_sciname)
+res_sig_con_vs_vmt <- getSignficantOnly(res_con_vs_vmt, location_sciname)
+res_sig_vmt_vs_vdz <- getSignficantOnly(res_vmt_vs_vdz , location_sciname)
+
+# make a dataframe to plot log fold change
+CON_vs_VDZ <- res_sig_con_vs_vdz %>% select(sciname, log2FoldChange) %>% mutate(contrast = "CON_vs_VDZ")  
+CON_vs_VMT <- res_sig_con_vs_vmt %>% select(sciname, log2FoldChange) %>% mutate(contrast = "CON_vs_VMT")  
+VMT_vs_VDZ <- res_sig_vmt_vs_vdz %>% select(sciname, log2FoldChange) %>% mutate(contrast = "VMT_vs_VDZ")  
+data_melted <- CON_vs_VMT %>% bind_rows(CON_vs_VDZ, VMT_vs_VDZ)
+
+diffab_location <- ggplot(data_melted, aes(x = contrast, y = log2FoldChange, fill = sciname)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  labs(title = '', x = 'Taxa', y = 'log2 Fold Change') +
+  scale_fill_brewer(palette = 'Set1') +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'gray') +
+  facet_wrap(~contrast, scales= "free") +
+  niceplot +
+  theme(axis.text.x = element_text(angle = 0, vjust = 0, hjust= 0.5))
+
+# save figure as pdf
+ggsave("figures/FigS3_diff_ab_location.pdf",diffab_location , height = 5, width = 9, dpi = 300)
+```
+
+
+## Day versus night
+
+There were no taxa with differential abundance for this factor. 
+
+```{r day vs night - metazoans only}
+# load dataset for day vs night
+load("results/pws_day_night.R")
+
+day_night_sciname <- pws_day_night %>% 
+  microbiome::aggregate_taxa(level = "sciname") 
+
+# convert to dataframe to check things
+pws_day_night_df <- speedyseq::psmelt(day_night_sciname)
+
+# create your deseq object indicating your factor
+daynight <- phyloseq_to_deseq2(day_night_sciname, ~ DayNight)
+daynight <- DESeq(daynight, test = "Wald", fitType = "parametric")
+
+# set up contrasts for clarity
+contrast <- c("DayNight", "Night", "Day")
+
+# run the results
+res <- results(daynight, contrast = contrast, alpha = 0.05, cooksCutoff = FALSE)
+#res = results(daynight, cooksCutoff = FALSE)
+res_sig <- getSignficantOnly(res, day_night_sciname)
+
+```
+
+## Tide
+
+There were no taxa with differential abundance for this factor. 
+
+```{r tide - metazoans only}
+# load dataset for day vs night
+load("results/pws_tide.R")
+
+tide_sciname <- pws_tide %>% 
+  microbiome::aggregate_taxa(level = "sciname") 
+
+# convert to dataframe to check things
+pws_tide_df <- speedyseq::psmelt(tide_sciname)
+
+# create your deseq object indicating your factor
+tide <- phyloseq_to_deseq2(tide_sciname, ~ tide)
+tide <- DESeq(tide, test = "Wald", fitType = "parametric")
+
+# set up contrasts for clarity and run results
+res_slack_vs_ebb <- results(tide, contrast = c("tide", "Slack", "Ebb"))
+res_slack_vs_flood <- results(tide, contrast = c("tide", "Slack", "Flood"))
+res_ebb_vs_flood <- results(tide, contrast = c("tide", "Ebb", "Flood"))
+
+# get significant table if any
+res_sig_slack_vs_ebb <- getSignficantOnly(res_slack_vs_ebb, tide_sciname)
+res_sig_slack_vs_flood <- getSignficantOnly(res_slack_vs_flood, tide_sciname)
+res_sig_ebb_vs_flood <- getSignficantOnly(res_ebb_vs_flood , tide_sciname)
+
+```
+
+## Temporal
+
+```{r temporal - metazoans only}
+# By SCINAME----
+# load dataset for temporal
+load("results/pws_temporal.R")
+
+temporal_sciname <- pws_temporal %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>% 
+  fixFactorsOrder()
+
+# convert to dataframe to check things
+pws_temporal_df <- speedyseq::psmelt(temporal_sciname)
+
+# create your deseq object indicating your factor
+year <- phyloseq_to_deseq2(temporal_sciname, ~ year)
+year <- DESeq(year, test = "Wald", fitType = "parametric")
+
+# set up contrasts for clarity and run results
+res_2017vs2018 <- results(year, contrast = c("year", "2017", "2018"))
+res_2018vs2019 <- results(year, contrast = c("year", "2018", "2019"))
+res_2019vs2021 <- results(year, contrast = c("year", "2019", "2021"))
+
+# get significant table if any
+res_sig_2017vs2018 <- getSignficantOnly(res_2017vs2018, temporal_sciname)
+res_sig_2018vs2019 <- getSignficantOnly(res_2018vs2019, temporal_sciname)
+res_sig_2019vs2021 <- getSignficantOnly(res_2019vs2021 , temporal_sciname)
+
+# By PLANKTON GROUP----
+# aggregate by plankton group
+temporal_sciname <- pws_temporal %>% 
+  addPlanktonGroupToTaxTable() %>%
+  phyloseq::subset_taxa(., plankton_group != "CHECK") %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>%
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  fixFactorsOrder() %>% 
+  microbiome::aggregate_taxa(level = "plankton_group") 
+
+# convert to dataframe to check things
+pws_temporal_df <- speedyseq::psmelt(temporal_sciname)
+
+# create your deseq object indicating your factor
+year <- phyloseq_to_deseq2(temporal_sciname, ~ year)
+year <- DESeq(year, test = "Wald", fitType = "parametric")
+
+# set up contrasts for clarity and run results
+res_2017vs2018 <- results(year, contrast = c("year", "2017", "2018"))
+res_2018vs2019 <- results(year, contrast = c("year", "2018", "2019"))
+res_2019vs2021 <- results(year, contrast = c("year", "2019", "2021"))
+
+# get significant table if any
+res_sig_2017vs2018 <- getSignficantOnly(res_2017vs2018, temporal_sciname)
+res_sig_2018vs2019 <- getSignficantOnly(res_2018vs2019, temporal_sciname)
+res_sig_2019vs2021 <- getSignficantOnly(res_2019vs2021 , temporal_sciname)
+
+# make a dataframe to plot log fold change
+#Apr_vs_May <- vmt_sig_AprVsMay %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "Apr_vs_May")  
+df_2017vs2018 <- res_sig_2017vs2018 %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "2017_vs_2018")  
+df_2018vs2019 <- res_sig_2018vs2019 %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "2018_vs_2019")  
+df_2019vs2021 <- res_sig_2019vs2021 %>% select(plankton_group, log2FoldChange) %>% mutate(contrast = "2019_vs_2021")  
+
+
+# Combine and plot
+data_melted <- df_2017vs2018 %>%
+  bind_rows(df_2018vs2019, df_2019vs2021) %>% 
+  mutate(f_contrast = factor(contrast, levels = c("2017_vs_2018", "2018_vs_2019", "2019_vs_2021"), ordered = T))
+
+diffab_temporal <- ggplot(data_melted, aes(x = f_contrast, y = log2FoldChange, fill = plankton_group)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  labs(title = '', x = 'Taxa', y = 'log2 Fold Change') +
+  scale_fill_manual(values = cbPalette, name = "") +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'gray') + 
+  niceplot
+
+# save figure as pdf
+ggsave("figures/FigS4_diff_ab_temporal.pdf", diffab_temporal , height = 6, width = 11, dpi = 300)
+```
+
+

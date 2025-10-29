@@ -1,0 +1,212 @@
+---
+title: "Merge ASV tables"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r knitting setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = F,
+                      comment = "",
+                      tidy.opts = list(width.cutoff = 55),
+                      tidy = T)
+```
+
+# Overview
+
+This document includes R code to crop and merge the ASV tables from the six sequencing runs with PWS AK zooplankton data.
+
+Basic code was taken from the dada2 online tutorials + improvements/optimization by Paula Pappalardo to do things in batch for multiple runs. 
+
+Details:
+- the input are the seqtab tables saved as .rds objects after running dada2
+- the script merges all seqtab tables after filtering to amplicon target size
+- chimeras are removed from the combined seqtab tables
+- the script generates a fasta file with all the ASVs and a tracking file
+
+
+
+```{r setup}
+# load libraries
+
+library(ggplot2)
+library(dplyr)
+library(phyloseq)
+library(Biostrings)
+library(dada2)
+library(stringr)
+library(flextable)
+
+
+```
+
+
+```{r functions we need}
+# function to crop seqtab objects
+filterSeqTab <- function(seqtab, minbp, maxbp){
+  seqtab_filtered <- seqtab[,nchar(colnames(seqtab)) %in% minbp:maxbp]
+  return(seqtab_filtered)
+}
+
+# function to get bp length from ASV names
+keepCharCounts <- function(seqtab){
+  thisvec <- nchar(colnames(seqtab))
+  return(thisvec)
+}
+
+```
+
+# Merge ASV tables
+
+We will first crop each ASV table to increase the likelihood of ASV merges. Given our target amplicon size of 313 and inspection of distribution of bp for each run, we will keep reads between 309 and 317 bp.
+
+```{r filtered tables}
+# set up filtering parameters
+
+minbp = 310
+maxbp = 316
+
+# get vector of file names 
+
+seq_tables <- sort(list.files("dada2", pattern="_seqtab.rds", full.names = TRUE))
+
+# create a folder to put filtered files
+dir.create("filtered-seqtab") 
+
+# loop over ASV tables to filter them all at the same amplicon size
+
+for(i in 1:length(seq_tables)){
+  filtered_seqtab <- readRDS(seq_tables[i]) %>%
+    filterSeqTab(., minbp, maxbp)
+  saveRDS(filtered_seqtab, file = str_replace(seq_tables[i], "dada2/", "filtered-seqtab/"))
+}
+
+# get vector of file names for filtered tables
+
+seq_tables_filtered <- list.files("filtered-seqtab", pattern="_seqtab.rds", full.names = TRUE)
+
+# Merge multiple runs (if necessary)
+
+all_runs_filtered <- mergeSequenceTables(tables = seq_tables_filtered)
+
+# Remove chimeras
+
+seqtab_nochim_filtered <- removeBimeraDenovo(all_runs_filtered, method = "consensus", multithread = TRUE)
+dim(seqtab_nochim_filtered)
+
+# save nochim merged table for the cropped ASV tables
+
+saveRDS(seqtab_nochim_filtered, "filtered-seqtab/seqtab_nochim_filtered.rds")
+
+# check how many ASVs we have to BLAST
+dim(seqtab_nochim_filtered)
+```
+
+## Save fasta file from filtered table
+
+```{r save fasta file of ASVs}
+asvs <- seqtab_nochim_filtered
+
+# check out dimensions of asv file
+dim(asvs) #   273 10128
+
+# vector for sequence names
+seqnames <- paste("ASV", seq(1:dim(asvs)[2]), sep = "_")
+
+# create DNAStringSet object to hold sequences
+seqs <- DNAStringSet(colnames(asvs))
+names(seqs) <- seqnames
+
+# Save sequences as FASTA file
+writeXStringSet(seqs, "filtered-seqtab/all_sequences_filtered_PWS-zooplankton.fasta")
+
+# Save translation table
+trans_table <- data.frame(seqs = colnames(asvs),
+                          short_names = seqnames,
+                          number_bp = nchar(colnames(asvs)))
+
+save(trans_table, file = "filtered-seqtab/all_sequences_filtered-to-shortnames.R")
+```
+
+## Tracking files
+
+Here we compile the tracking files from all runs, remove external controls, and are the information of final reads after cropping and chimera removal.
+
+```{r combine tracking files}
+# get vector of tracked file names 
+
+track_tables <- sort(list.files("dada2", pattern="_seqs_tracked.csv", full.names = TRUE))
+track_tables
+
+# loop over files and combine
+holder <- list()
+for(i in 1:length(track_tables)){
+  thistable <- read.csv(track_tables[i], col.names = c("sample_name", "input_reads", "filtered_reads", "denoisedF", "denoisedR", "merged_reads"), header = T)
+  thistable$run_name <- str_replace_all(track_tables[i], "dada2/final_report/", "")
+  thistable$run_name <- str_replace_all(thistable$run_name, "_seqs_tracked.csv", "")
+  thistable -> holder[[i]]
+}
+
+holder_df <- do.call("bind_rows", holder)
+
+# get number of reads after removing chimeras
+nochim <- readRDS("filtered-seqtab/seqtab_nochim_filtered.rds")
+nochim_sum <- rowSums(nochim)
+nochim_df <- data.frame(sample_name = rownames(nochim), reads_no_chimeras = nochim_sum)
+
+
+# subset final dataset for analysis
+final_tracking <- holder_df %>% 
+  filter(!(grepl("COIml", run_name))) %>% # remove the few samples done with Leray's primers that we are not using
+  filter(!(grepl("Valdez2017_ml", run_name))) %>% 
+  left_join(nochim_df, by = "sample_name") %>%
+  # remove the negative controls from table
+  filter(!(grepl("_EC_", sample_name))) %>% 
+  #filter(reads_no_chimeras != 0) %>% 
+  #filter(!is.na(reads_no_chimeras)) %>% 
+  relocate(run_name, .before = sample_name) %>% 
+  mutate(run_name = str_replace_all(run_name, "dada2/", "")) 
+
+# create a folder to put tables
+dir.create("tables") 
+
+write.csv(final_tracking, row.names = F, file = "tables/final_tracking_PWS_zooplankton.csv")
+
+# summaries for text
+# how many total raw reads
+sum(final_tracking$input_reads) #53220957
+# how many final reads  
+sum(final_tracking$reads_no_chimeras) #34365090
+
+
+set_flextable_defaults(font.size = 10)
+
+pretty_tracking <- qflextable(final_tracking) %>% 
+  #rotate(., j = 3:16, align = "bottom", rotation = "btlr", part = "header") %>% 
+  #width(., width = 1) %>%
+  set_header_labels(., values = c(
+    run_name = "Run name",
+    sample_name = "Sample name",
+    input_reads = "Input reads",
+    filtered_reads = "Filtered reads",
+    denoisedF = "Denoised forward reads",
+    denoisedR = "Denoised reverse reads",
+    merged_reads = "Merged reads",
+    reads_no_chimeras = "Final reads"
+  )) %>% 
+  #theme_zebra() %>% 
+  fit_to_width(., max_width = 7)
+
+save_as_docx(pretty_tracking, path = "tables/Table_S4_combined-tracking-file.docx")
+
+save(pretty_tracking, file = "tables/Table_S4.R")
+
+```
+

@@ -1,0 +1,501 @@
+---
+title: "Taxonomic assignment"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r knitting setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = F,
+                      comment = "",
+                      tidy.opts = list(width.cutoff = 55),
+                      tidy = T)
+```
+# Overview
+
+This file includes the R code to combine BLASTn results to four reference databases and generate a file of final IDs for each ASV. There are steps for QC and filtering of blast results, selecting the best hits from each reference database, and comparing hits across reference databases. 
+
+```{r setup}
+# load libraries
+
+library(tidyverse)
+library(seqinr)
+library(data.table)
+library(taxize)
+library(rgbif)
+library(vroom)
+
+# create a folder to store temporary files
+dir.create("temp-r-objects") 
+
+# create a folder to save results
+dir.create("results") 
+
+# source functions and things we need [citation to GitHub/Zenodo repo will be provided]
+
+source("003a_Taxonomic-assignment-functions.R") 
+
+```
+
+
+## References databases
+
+I used BLASTn version 2.10.1+ in the Smithsonian Institution High-Performance Computing Cluster for the taxonomic assignments of unknown ASVs (version can be checked using *blastn -version* or will appear in the log file too). To decide on final ID, I inspected matches against four databases (all described in the Supporting Information):
+
+* Moss Landing Marine Labs database (MLML)
+
+* MIDORI2 version GB259
+
+* BOLD public version BOLD_Public_06-Oct-2023
+
+* Lavrador et al. 2023
+
+To create the blast databases I used:
+
+*makeblastdb -in yourReferenceSequences.fasta -parse_seqids -dbtype "nucl" -out referenceDB -title referenceDB*
+ 
+The BLAST call was:
+
+*blastn -task blastn -db dbName -query querySeqsFasta -word_size 11 -max_target_seqs 200 -evalue 0.01 -outfmt "6 qseqid sseqid staxids sscinames evalue bitscore length qcovs nident pident" -out blastResults.tsv*
+
+## BLAST results and taxonomic assignments
+
+```{r load blast results}
+# blast to MIDORI
+midori_blast <- fread("blast/blast_results_PWS_to_midori.tsv", fill = T,
+                         col.names = c("query_seqid", "result_seqid", "scinames", "evalue", "bitscore",
+                         "length", "percent_coverage", "nident", "percent_identity")) %>% select(-scinames)
+
+# blast to MLML
+mlml_blast <- fread("blast/blast_results_PWS_to_MLML.tsv", fill = T,
+                         col.names = c("query_seqid", "result_seqid", "taxid", "sscinames", "evalue", "bitscore",
+                         "length", "percent_coverage", "nident", "percent_identity")) %>% select(-taxid, -sscinames)
+
+# blast to BOLD
+bold_blast <- vroom("blast/blast_results_PWS_to_BOLD.tsv", col_names = c("query_seqid", "result_seqid",  "sscinames", "evalue", "bitscore",
+                         "length", "percent_coverage", "nident", "percent_identity"), delim = "\t") %>% select(-sscinames)
+
+# blat to Lavrador database
+lavrador_blast <- fread("blast/blast_results_PWS_to_Lavrador.tsv", fill = T,
+                         col.names = c("query_seqid", "result_seqid", "taxid", "sscinames", "evalue", "bitscore",
+                         "length", "percent_coverage", "nident", "percent_identity")) %>% select(-taxid, -sscinames)
+
+# check how many ASVs got returned
+length(unique(midori_blast$query_seqid))
+length(unique(mlml_blast$query_seqid))
+length(unique(lavrador_blast$query_seqid))
+length(unique(bold_blast$query_seqid))
+```
+
+### Check for identical BLAST results
+
+We are going to use some customized functions from Pappalardo et al, 2025 (MEE, https://besjournals.onlinelibrary.wiley.com/doi/abs/10.1111/2041-210X.70147) to track all similarity measures for each match (for the same ASVs), so we can check that there are no identical "best hits" and if they are we will select the common ancestor or check them out manually. In this section we also filter for BLAST quality, keeping only matches with more than 250 bp of alignment length, and higher than 95% coverage. We also check evalue is lower than 0.01 (although we specified that in the blast call).
+
+Our bryozoan taxonomist, Linda McCann, revised our matches to bryozoans and their taxonomic status. Based on her input, the hit to species "Membranipora serrilamella" were edited to "Membranipora villosa" for being a synonym and M villosa the preffered name.
+
+```{r identical blast result check - MLML}
+# MLML 
+mlml_kt_taxonomy <- readRDS("taxfiles/mlml_kt_taxonomy.rds")
+
+# Filter by quality and add higher taxonomy
+mlml_checked <- mlml_blast %>% 
+  filter(!(grepl("MLML__COI__Bryozoa__302084__Membranipora_serrilamella__Provisional", result_seqid))) %>%  
+  filterBlastResults(., n_to_keep = 30,  min_cov = 95, min_length = 250, max_evalue = 0.01) %>% 
+  group_by(query_seqid) %>% # first grouping if for the tagging function
+  group_map(~ tagIdenticalHits(.x), .keep = T) %>% 
+  do.call("bind_rows", .) %>% 
+  mutate(result_seqid = str_replace_all(result_seqid, "-", "_")) %>% 
+  #left_join(ref_sequences_with_tax, by = c("result_seqid" = "fasta_names")) %>% # if using regular MLML
+  left_join(mlml_kt_taxonomy, by = c("result_seqid" = "new_fasta_name")) %>% # for updated mlml
+  mutate(species = ifelse(species == "Membranipora serrilamella", "Membranipora villosa", species))
+
+# identify the ones we need to check manually
+View(mlml_checked %>% filter(best_check == "to check") %>% distinct(query_seqid))
+View(mlml_checked %>% filter(best_check == "to check" & percent_identity > 95) %>% distinct(query_seqid))
+View(mlml_checked %>% filter(best_check == "to check") %>% filter(percent_identity > 95 & tagged == TRUE))
+View(mlml_checked %>% filter(best_check == "to check") %>% filter(percent_identity > 95)  %>%  distinct(result_seqid)) 
+
+# also check that everything got assigned higher taxonomy
+View(mlml_checked %>% filter(is.na(phylum)))
+
+# save tagged files
+save(mlml_checked, file = "temp-r-objects/alaska-pws_mlml_checked.R")
+```
+
+For MLML, there were 1748 ASVs with identical similarity measures in multiple rows, of those, only 39 with higher than 95% identity. Those are all matches to MLML sequences (from SERC vouchers) to Membranipora species. Often the conflicts are between M. serrilamella and M. membranacea. These get backed up to genus.
+
+For MIDORI, Jon Geller identified a set of Balanus nubilis sequences that are incorrect and should be Balanus crenatus. These sequences will get filtered out in the code below to avoid incorrect assignments.
+ 
+Balanus nubilus - MZ580889.1
+Balanus nubilus - MZ580891.1
+Balanus nubilus - MZ580895.1
+Balanus nubilus - MZ580906.1
+Balanus nubilus - MZ580912.1
+
+For each database, blast results are quality clean first, using minimum coverage values of 95%, maximum evalue threshold of 0.01, and minimum alignment length of 250. We also keep a reduced amount of entries (n = 50) from the BLAST result to speed up computation in follow up functions.
+
+```{r identical blast results check - MIDORI}
+# MIDORI --------------
+load("taxfiles/midori_taxonomy_gb259.R")
+
+# add taxonomy source
+midori_taxonomy <- midori_taxonomy %>% 
+  mutate(taxonomy_source = "ncbi")
+
+# merge checked files with taxonomy
+
+midori_checked <- midori_blast %>%
+  filter(!(grepl("MZ580889.1", result_seqid) |
+             grepl("MZ580891.1", result_seqid) |
+             grepl("MZ580895.1", result_seqid) |
+             grepl("MZ580906.1", result_seqid) |
+             grepl("MZ580912.1", result_seqid))) %>%
+  filterBlastResults(., n_to_keep = 30,  min_cov = 95, min_length = 250, max_evalue = 0.01) %>% 
+  group_by(query_seqid) %>% # first grouping if for the tagging function
+  group_map(~ tagIdenticalHits(.x), .keep = T) %>% 
+  do.call("bind_rows", .) %>% 
+  left_join(midori_taxonomy, by = c("result_seqid" = "fasta_names")) %>% 
+  dplyr::rename(reported_sciname = sciname) %>% # as reported in sequence versus the one that could end up from common ancestor
+  mutate(phylum = ifelse(phylum == "phylum", NA_character_, phylum)) %>% # make true NA cases where midori reports "phylum" 
+  mutate(species = ifelse(species == "Membranipora serrilamella", "Membranipora villosa", species)) # fix synonym we care for before mca based on SERC byrozoan taxonomist input
+
+
+# identify the ones we need to check manually
+View(midori_checked %>% filter(best_check == "to check") %>% distinct(query_seqid))
+View(midori_checked %>% filter(best_check == "to check") %>% filter(percent_identity > 95) %>% distinct(query_seqid))
+View(midori_checked %>% filter(best_check == "to check") %>% filter(percent_identity > 95 & tagged == TRUE))
+# save tagged files
+save(midori_checked, file = "temp-r-objects/alaska-pws_midori_checked.R")
+
+```
+
+There were 3475 ASVs with identical similarity, of those, 1172 with higher than 95% identity that had identical similarity measures in multiple rows. From a quick look, they all tend to be the same species. These will get addressed below by running the most common ancestor function.
+
+
+```{r identical blast result check - lavrador}
+# Lavrador
+lavrador_tax <- read.csv("taxfiles/lavrador_taxonomy_file.csv")
+
+# Lavrador --------------
+lavrador_checked <- lavrador_blast %>% 
+  filterBlastResults(., n_to_keep = 30,  min_cov = 95, min_length = 250, max_evalue = 0.01) %>% 
+  group_by(query_seqid) %>% 
+  group_map(~ tagIdenticalHits(.x), .keep = T) %>% 
+  do.call("bind_rows", .) %>% 
+  left_join(lavrador_tax, by = c("result_seqid" = "fasta_name"))  %>% 
+  mutate(taxonomy_source = "gbif") %>% 
+  mutate(species = ifelse(species == "Membranipora serrilamella", "Membranipora villosa", species)) # fix synonym we care for before mca
+
+# identify the ones we need to check manually
+View(lavrador_checked %>% filter(best_check == "to check") %>% distinct(query_seqid))
+View(lavrador_checked %>% filter(best_check == "to check" & percent_identity > 95) %>% distinct(query_seqid))
+View(lavrador_checked %>% filter(best_check == "to check") %>% filter(percent_identity > 95 & tagged == TRUE))
+View(lavrador_checked %>% filter(best_check == "to check") %>% filter(percent_identity > 95)  %>%  distinct(result_seqid)) 
+
+# also check that everything got assigned higher taxonomy
+View(lavrador_checked %>% filter(is.na(phylum)))
+
+# save tagged files
+save(lavrador_checked, file = "temp-r-objects/alaska-pws_lavrador_checked.R")
+```
+
+
+```{r identical blast result check - BOLD}
+# load BOLD higher taxonomy file
+bold_taxonomy <- readRDS("taxfiles/BOLD_Public_06-Oct-2023_cleaned.rds")
+
+# filter by quality and add higher taxonomy
+bold_checked <- bold_blast %>% 
+  filterBlastResults(., n_to_keep = 30,  min_cov = 95, min_length = 250, max_evalue = 0.01) %>% 
+  group_by(query_seqid) %>% # first grouping if for the tagging function
+  group_map(~ tagIdenticalHits(.x), .keep = T) %>% 
+  do.call("bind_rows", .) %>% 
+  left_join(bold_taxonomy, by = c("result_seqid" = "fasta_names")) %>% 
+  mutate(species = ifelse(species == "Membranipora serrilamella", "Membranipora villosa", species))
+
+# identify the ones we need to check manually
+View(bold_checked %>% filter(best_check == "to check") %>% distinct(query_seqid))
+View(bold_checked %>% filter(best_check == "to check" & tagged == "TRUE") %>% filter(percent_identity > 95))
+
+# check that everything has higher taxonomy
+View(bold_checked %>% filter(is.na(phylum)))
+
+# save tagged files
+save(bold_checked, file = "temp-r-objects/alaska-kt_bold_checked.R")
+
+# remove things not in use
+#rm(bold_taxonomy)
+```
+
+## Pick a final ID for each ASV
+
+For the identical hits, we are going to collapse them using my customized common ancestor function from Pappalardo et al. 2025 (MEE, https://besjournals.onlinelibrary.wiley.com/doi/abs/10.1111/2041-210X.70147), and keep track of of the combined match names just in case. The goal is to keep only one ID per database.
+
+
+```{r pick final ID for each database}
+# MLML ----------------
+# get common ancestor for mlml identical hits
+
+mlml_mrca <- mlml_checked %>% 
+  filter(best_check == "to check") %>% 
+  getCommonAncestor(.)
+
+# keep best hit
+mlml_final <- mlml_checked %>% 
+  filter(best_check != "to check") %>% 
+  group_by(query_seqid) %>% 
+  slice_head(., n = 1) %>% 
+  ungroup() %>% 
+  select(query_seqid, result_seqid, kingdom, phylum, class, order, family, genus, species, bitscore, length, percent_coverage, percent_identity, taxonomy_source) %>%
+  bind_rows(mlml_mrca) %>% 
+  rowwise() %>% 
+  mutate(sciname = tail(na.omit(c(kingdom, phylum, class, order, family, genus, species)), n = 1)) %>%
+  ungroup() %>% 
+  relocate(sciname, .after = species) 
+
+# save final assignments
+save(mlml_final, file = paste("temp-r-objects/alaska-pws_mlml_final_", Sys.Date(), ".R", sep = ""))
+
+# MIDORI --------------
+
+# get common ancestor for midori identical hits
+
+midori_mrca <- midori_checked %>% 
+  filter(best_check == "to check") %>% 
+  getCommonAncestor(.)
+
+# keep best hit for midori
+
+# keep best hit
+midori_final <- midori_checked %>% 
+  filter(best_check != "to check") %>% 
+  group_by(query_seqid) %>% 
+  slice_head(., n = 1) %>% 
+  ungroup() %>% 
+  select(query_seqid, result_seqid, kingdom, phylum, class, order, family, genus, species, bitscore, length, percent_coverage, percent_identity, taxonomy_source) %>% 
+  bind_rows(midori_mrca) %>% 
+  rowwise() %>% 
+  mutate(sciname = tail(na.omit(c(kingdom, phylum, class, order, family, genus, species)), n = 1)) %>%   ungroup() %>%
+  relocate(sciname, .after = species) 
+
+# save final assignments
+save(midori_final, file = paste("temp-r-objects/alaska-pws_midori_final_", Sys.Date(), ".R", sep = ""))
+
+# BOLD ----------------
+# get common ancestor for identical hits
+
+bold_mrca <- bold_checked %>% 
+  filter(best_check == "to check") %>% 
+  getCommonAncestor(.)
+
+# keep best hit
+bold_final <- bold_checked %>% 
+  filter(best_check != "to check") %>% 
+  group_by(query_seqid) %>% 
+  slice_head(., n = 1) %>% 
+  ungroup() %>% 
+  select(query_seqid, result_seqid, kingdom, phylum, class, order, family, genus, species, bitscore, length, percent_coverage, percent_identity, taxonomy_source) %>%
+  bind_rows(bold_mrca) %>% 
+  rowwise() %>% 
+  mutate(sciname = tail(na.omit(c(kingdom, phylum, class, order, family, genus, species)), n = 1)) %>%   ungroup() %>%
+  relocate(sciname, .after = species)
+
+# save final assignments
+save(bold_final, file = paste("temp-r-objects/alaska-pws_bold_final_", Sys.Date(), ".R", sep = ""))
+
+# Lavrador ----------------
+# get common ancestor for  identical hits
+
+lavrador_mrca <- lavrador_checked %>% 
+  filter(best_check == "to check") %>% 
+  getCommonAncestor(.)
+
+# keep best hit
+lavrador_final <- lavrador_checked %>% 
+  filter(best_check != "to check") %>% 
+  group_by(query_seqid) %>% 
+  slice_head(., n = 1) %>% 
+  ungroup() %>% 
+  select(query_seqid, result_seqid, kingdom, phylum, class, order, family, genus, species, bitscore, length, percent_coverage, percent_identity, taxonomy_source) %>% 
+  bind_rows(lavrador_mrca) %>% 
+  rowwise() %>% 
+  mutate(sciname = tail(na.omit(c(kingdom, phylum, class, order, family, genus, species)), n = 1)) %>%   ungroup() %>%
+  relocate(sciname, .after = species) 
+
+# save final assignments
+save(lavrador_final, file = paste("temp-r-objects/alaska-pws_lavrador_final_", Sys.Date(), ".R", sep = ""))
+
+```
+
+## Compare between reference databases
+
+
+```{r load all final datasets if needed}
+load("temp-r-objects/alaska-pws_lavrador_final_2025-10-27.R")
+load("temp-r-objects/alaska-pws_midori_final_2025-10-27.R")
+load("temp-r-objects/alaska-pws_mlml_final_2025-10-27.R")
+load("temp-r-objects/alaska-pws_bold_final_2025-10-27.R")
+```
+
+
+### BOLD vs MIDORI 
+
+This approach does first pass between the two public databases BOLD and MIDORI, and use newly design comparing functions to get a best match to the lowest taxonomic level possible from these two databases first.
+
+```{r pick between BOLD and MIDORI}
+mid_vs_bold <- compareBOLDandMIDORI(mydf_midori = midori_final,
+                                    mydf_bold = bold_final,
+                                    identity_th = 98) %>% 
+  pickFinalTax_BoldVsMidori(.) 
+
+#TODO: below there are several checks to see how things work if you run it without the last line of actually picking up the final hit
+
+# #if you are curious for taxa that have same sciname and different higher taxonomy
+# View(mid_vs_bold %>% filter(sciname_agree == TRUE & sciname_level_agree == FALSE))
+# table(mid_vs_bold$match_outcome)
+# # other checks
+# View(mid_vs_bold %>% filter(sciname_agree == FALSE & sciname_level_agree == TRUE) %>% select(tax_string_midori, percent_identity_midori, tax_string_bold, percent_identity_bold, sciname_midori, sciname_level_midori, sciname_bold, sciname_level_bold) %>% filter(percent_identity_midori > 95 | percent_identity_bold>95))
+# 
+# # cases that are tricky and relevant (same sciname_level and different sciname and high matches)
+# # some of these may be synonyms...if we check them as of now, the species/genus/taxa names may not match
+# # example for species Bipalponephtys neotena in BOLD & Micronephthys neotena in MIDORI
+# # but in these cases...picking either is correct and eventually we will standardize to GBIF taxonomy so no real issues there
+# View(mid_vs_bold %>% filter(sciname_agree == FALSE & sciname_level_agree == TRUE) %>% select(query_seqid, tax_string_midori, tax_string_bold, percent_identity_midori, percent_identity_bold, sciname_midori, sciname_level_midori, sciname_bold, sciname_level_bold, match_outcome, best_db_identity) %>% filter(percent_identity_midori >= 98 & percent_identity_bold>=98) %>% mutate(diff=percent_identity_midori-percent_identity_bold) %>% arrange(sciname_midori))
+# 
+# View(mid_vs_bold %>% filter(match_outcome == "CHECK" & (percent_identity_midori >97 & percent_identity_bold > 97)) %>% select(tax_string_midori, tax_string_bold, percent_identity_midori, percent_identity_bold, sciname_midori, sciname_level_midori, sciname_bold, sciname_level_bold))
+# 
+# # cases with conflicts at very high match for both
+# View(mid_vs_bold %>% filter(percent_identity_midori >= 98 & percent_identity_bold >= 98 & tax_string_midori != tax_string_bold))
+```
+
+```{r pick between MLML and Lavrador}
+mlml_vs_lavrador <- compareMLMLandLavrador(mydf_mlml = mlml_final,
+                         mydf_lavrador = lavrador_final,
+                         identity_th = 98) %>% 
+  pickFinalTax_MLMLvsLavrador() 
+
+#TODO: below there are several checks to see how things work if you run it without the last line of actually picking up the final hit
+
+# #if you are curious for taxa that have same sciname and different higher taxonomy
+# View(mlml_vs_lavrador %>% filter(sciname_agree == TRUE & sciname_level_agree == FALSE)) # none
+# # what kind of outcomes we get
+# table(mlml_vs_lavrador$match_outcome)
+# # sciname does not agree at same level and one of the matches is high
+# View(mlml_vs_lavrador %>% filter(sciname_agree == FALSE & sciname_level_agree == TRUE) %>% select(tax_string_lavrador, percent_identity_lavrador, tax_string_mlml, percent_identity_mlml, sciname_lavrador, sciname_level_lavrador, sciname_mlml, sciname_level_mlml) %>% filter(percent_identity_lavrador > 95 | percent_identity_mlml>95))
+# 
+# # cases that are tricky and relevant (same sciname_level and different sciname and high matches)
+# 
+# View(mlml_vs_lavrador %>% filter(sciname_agree == FALSE & sciname_level_agree == TRUE) %>% select(query_seqid, tax_string_lavrador, tax_string_mlml, percent_identity_lavrador, percent_identity_mlml, sciname_lavrador, sciname_level_lavrador, sciname_mlml, sciname_level_mlml, match_outcome, best_db_identity) %>% filter(percent_identity_lavrador >= 98 & percent_identity_mlml>=98) %>% mutate(diff=percent_identity_lavrador-percent_identity_mlml) %>% arrange(sciname_lavrador))
+# 
+# # any outcome that remained as "CHECK"
+# View(mlml_vs_lavrador %>% filter(match_outcome == "CHECK" & (percent_identity_lavrador >97 & percent_identity_mlml > 97)) %>% select(tax_string_lavrador, tax_string_mlml, percent_identity_lavrador, percent_identity_mlml, sciname_lavrador, sciname_level_lavrador, sciname_mlml, sciname_level_mlml))
+# 
+# # cases with conflicts at very high match for both
+# # here species name agree is that the higher taxonomy that is slightly different
+# View(mlml_vs_lavrador %>% filter(percent_identity_lavrador >= 98 & percent_identity_mlml >= 98 & tax_string_lavrador != tax_string_mlml))
+
+```
+
+I checked all of the possible combinations of different taxonomic levels in one or the other database when both matches were higher than 98%. In all cases I think my function is deciding correctly what should be picked. For the publication, all matches were updated using GBIF taxonomic framework on Apr 16, 2025. Taxonomic fixes for the ones without proper matches were updated on Jun 2, 2025.
+
+```{r pick up final match from mid vs bold and mlml vs lavrador winners}
+# compare winners
+global_vs_curated <- compareGlobalVsCurated(mydf_global = mid_vs_bold,
+                                            mydf_curated = mlml_vs_lavrador,
+                                            identity_th = 98) %>% 
+  pickFinalTax_GlobalVsCurated() 
+
+# # check for conflicts
+# View(global_vs_curated %>% filter(percent_identity.x >= 98 & percent_identity.y >= 98 & sciname.x != sciname.y & sciname_level.x == "species" & sciname_level.y == "species") %>% distinct(match_name.x, sciname.x, tax_string.x, match_name.y, sciname.y, tax_string.y))
+
+# get names to search on GBIF
+unique_names <- sort(unique(global_vs_curated$sciname))
+#sciname_matched <- matchToGBIF(unique_names)
+
+# save final matched file
+#save(sciname_matched, file = paste("temp-r-objects/pws-scinames_matched_to_gbif_", Sys.Date(),".R", sep = ""))
+
+# things to check and fix
+# View(sciname_matched %>% filter(matchType == "HIGHERRANK"))
+# View(sciname_matched %>% filter(matchType != "HIGHERRANK" & is.na(species)))
+# View(sciname_matched %>% filter(matchType != "HIGHERRANK" & is.na(species) & is.na(rank)))
+# View(sciname_matched %>% filter(matchType != "HIGHERRANK" & is.na(species) & !is.na(rank)))
+
+gbif_dictionary <- sciname_matched %>%
+  dplyr::select(verbatim_name, kingdom, phylum, class, order, family, genus, species) %>%
+  dplyr::mutate(taxonomy_source = "gbif")
+
+
+gbif_dictionary_updated <- gbif_dictionary %>%
+  rows_update(gbif_updates, by = "verbatim_name", unmatched = "ignore") %>% 
+  mutate(class = case_when(is.na(class) & order %in% tele_orders ~ "Teleostei",
+                           order == "Enoplida" ~ "Enoplea",
+                           T ~ class))
+
+
+# things to check and fix
+View(gbif_dictionary_updated %>% filter(is.na(phylum)))
+View(gbif_dictionary_updated %>% filter(is.na(class)))
+View(gbif_dictionary_updated %>% filter(is.na(class) & !is.na(family)))
+
+save(gbif_dictionary_updated, file = paste("temp-r-objects/gbif_dictionary_updated_", Sys.Date(), ".R", sep = ""))
+
+```
+
+Next, we compile the list of all ASVs sent to blast, since some are not returned by BLASt when the matches are very poor quality and do not pass the minimum standards. Those will be classified as unassigned.
+
+GBIF taxonomic backbone has barnacles with Class Maxillopoda, we are following the reviweres suggestion and manually switching to Class Thecostraca following WoRMS.
+
+```{r get global final ids}
+# load fasta file to get complete list of ASVs sent to blast
+pws_fasta  <- read.fasta(file = "filtered-seqtab/all_sequences_filtered_PWS-zooplankton.fasta", seqtype = "AA", as.string = TRUE, set.attributes = FALSE)
+pws_fasta_df <- data.frame(query_seqid = names(pws_fasta),
+                            seqs = paste(pws_fasta))
+
+# get the final ids ready to use
+final_ids <- global_vs_curated %>%
+  dplyr::rename(old_taxonomy_source = taxonomy_source,
+                old_tax_string = tax_string,
+                old_sciname = sciname) %>%
+  right_join(pws_fasta_df, by = "query_seqid") %>% 
+  left_join(gbif_dictionary_updated, by = c("old_sciname" = "verbatim_name")) %>% 
+  mutate(kingdom = ifelse(kingdom %in% c("NA", "") | is.na(kingdom), "unassigned", kingdom)) %>% 
+  mutate(is_good_match_95 = ifelse(percent_identity >= 95, "yes", "no"),
+         is_good_match_96 = ifelse(percent_identity >= 96, "yes", "no"),
+         is_good_match_97 = ifelse(percent_identity >= 97, "yes", "no"),
+         is_good_match_98 = ifelse(percent_identity >= 98, "yes", "no"),
+         is_good_match_99 = ifelse(percent_identity >= 99, "yes", "no"),
+         is_good_match_100 = ifelse(percent_identity >= 100, "yes", "no")) %>% 
+  rowwise() %>% 
+  mutate(sciname = tail(na.omit(c(kingdom, phylum, class, order, family, genus, species)), n = 1)) %>% 
+  ungroup() %>% 
+  relocate(sciname, .after = species) %>% 
+  # our Bryozooan taxonomists (Linda McCann) said there is no support for the name Membranipora membranacea, we are backing up to genus
+  mutate(species = ifelse(species == "Membranipora membranacea", NA_character_, species),
+         sciname = ifelse(sciname == "Membranipora membranacea", "Membranipora", sciname)) %>% 
+  mutate(class = ifelse(class == "Maxillopoda", "Thecostraca", class))
+                      
+        
+# save final assignments
+
+save(final_ids, file = paste("results/alaska-pws_final_ids_", Sys.Date(), ".R", sep = ""))
+
+
+
+# remove things not in use
+rm(midori_blast, midori_checked, midori_mrca, midori_names, midori_taxonomy, midori_final,
+   mlml_blast, mlml_checked, mlml_mrca, mlml_final, mlml_kt_taxonomy,
+   bold_blast, bold_checked, bold_mrca, bold_final, bold_taxonomy,
+   lavrador_blast, lavrador_checked, lavrador_mrca, lavrador_final, lavrador_tax,
+   pws_fasta, pws_fasta_df, mid_vs_bold, mlml_vs_lavrador,
+   tele_orders, teleostei, sciname_matched, gbif_dictionary, gbif_dictionary_updated, gbif_updates,
+   global_vs_curated)
+```
+

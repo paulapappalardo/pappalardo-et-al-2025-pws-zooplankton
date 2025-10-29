@@ -1,0 +1,324 @@
+---
+title: "Summarizing data about species of concern"
+author: "Paula Pappalardo"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+
+```{r markdown setup}
+library(knitr)
+
+# tidy options
+
+knitr::opts_chunk$set(echo = T, eval= F, warning = F, message = F, comment = "",
+                      tidy.opts = list(width.cutoff = 55), tidy = TRUE)
+```
+
+# Overview
+
+Create summary tables of taxa and species of concern.
+
+```{r setup}
+library(tidyverse)
+library(flextable)
+library(officer)
+library(taxize)
+library(Biostrings)
+library(viridis)
+library(janitor)
+library("tidylog", warn.conflicts = FALSE)
+library(forcats)
+
+# source functions we need
+source("007a_Summarizing-data_functions.R") 
+
+# create a folder to put figures
+dir.create("figures") 
+
+# load data on invasive status and plankton group
+status_by_species <- read_csv("metadata/status_by_species.csv")
+
+# Paula's function we will need
+assign_unique <- function(vec){
+  if(length(na.omit(vec)) == 0){ # check for a vector of ONLY NAs
+    answer <- NA
+  } else {
+    answer <- paste(unique(na.omit(vec)), collapse = ";")
+  }
+  return(answer)
+}
+```
+
+
+# PWS zooplankton surveys
+
+
+```{r load data we need}
+# load phyloseq object
+load("results/pws_goodmeta.R")
+
+# make a dataframe from phyloseq object
+pws_goodmeta_df <- speedyseq::psmelt(pws_goodmeta) 
+
+```
+
+
+```{r introduced species table - Table 2}
+# load phyloseq object
+load("results/pws_alltarget.R")
+
+# make a dataframe from phyloseq object
+pws_alltarget_df <- speedyseq::psmelt(pws_alltarget) 
+
+introduced <- pws_alltarget_df %>% 
+  left_join(status_by_species, by = "species") %>% 
+  filter(Abundance != 0 & !is.na(species) & is_good_match_98 == "yes" & final_status_pws == "Introduced") %>% 
+  group_by(phylum, class, order, family, genus, species, plankton_group, location, year) %>% 
+  summarise(how_many_asvs = length(unique(OTU)),
+            how_many_samples = length(unique(Sample)),
+            total_sum_read_abundance = sum(Abundance),
+            which_databases = assign_unique(database_source)) %>% 
+  arrange(phylum, class, order, family, genus, species, location, year) %>% 
+  ungroup() 
+  
+# 
+# introduced_details <- pws_alltarget_df %>% 
+#   left_join(status_by_species_meta, by = "species") %>% 
+#   filter(Abundance != 0 & !is.na(species) & is_good_match_98 == "yes" & final_status_pws == "Introduced") %>% 
+#   group_by(phylum, class, order, family, genus, species, location, year) %>% 
+#   summarise(how_many_asvs = length(unique(OTU)),
+#             how_many_samples = length(unique(Sample)),
+#             total_sum_read_abundance = sum(Abundance),
+#             which_databases = assign_unique(database_source),
+#             which_samples = assign_unique(sample_number),
+#             which_salinity = mean(avg_salinity, na.rm = T),
+#             which_temperature = mean(avg_temperature, na.rm = T)) %>% 
+#   arrange(phylum, class, order, family, genus, species, location, year) %>% 
+#   ungroup() 
+  
+
+save(introduced, file = "temp-r-objects/introduced_species.R")
+```
+
+
+```{r table 2 - introduced species}
+introduced_pretty <- introduced %>% 
+  select(phylum, class,  species, plankton_group, year, location, how_many_asvs, how_many_samples, total_sum_read_abundance, which_databases) %>% 
+  arrange(phylum, class, species, plankton_group, year, location) %>% 
+  mutate(year = as.character(year)) %>% 
+  qflextable(.) %>% 
+  merge_v(., j = c("phylum", "class")) %>%  
+  valign(j = 1:3, valign = 'top') %>% 
+  #rotate(., j = 7:10, align = "bottom", rotation = "btlr", part = "header") %>% 
+  #width(., width = 1) %>%
+  set_header_labels(., values = c(
+    phylum = "Phylum",
+    class = "Class",
+    species = "Species",
+    year = "Year",
+    location = "Location",
+    plankton_group = "Plankton group",
+    how_many_asvs = "Number of ASVs",
+    how_many_samples = "Number of samples",
+    total_sum_read_abundance = "Total reads",
+    which_databases = "Database"
+  )) %>% 
+  #theme_zebra() %>% 
+  fit_to_width(., max_width = 7) 
+
+save_as_docx(introduced_pretty, path = "tables/Table_2_Introduced-species.docx")
+```
+
+
+```{r Figure 6 - barplot by status }
+fig_6 <-  pws_alltarget_df %>% 
+  left_join(status_by_species, by = "species") %>% 
+  filter(Abundance != 0 & kingdom == "Animalia" & is_good_match_98 == "yes" & !is.na(species)) %>%
+  addCustomTaxa() %>% 
+  mutate(updated_status = case_when(final_status_pws %in% c("Cryptogenic", "Cryptogenic in CA") ~ "Cryptogenic",
+                                    grepl("Native", final_status_pws) ~ "Native",
+                                    final_status_pws %in% c("Unresolved", "Unknown status - no occurrences in AK") ~ "Unresolved",
+                                    T ~ final_status_pws)) %>%
+  mutate(f_status = fct_relevel(updated_status, "Introduced", "Cryptogenic", "Unresolved", "Native")) %>% 
+  distinct(phylum, species, updated_status, f_status, custom_taxa) %>% 
+  #ggplot(data = ., aes(x = reorder(updated_status, -n), y = n, fill = phylum)) +
+  ggplot(data = ., aes(x = f_status, fill = custom_taxa)) +
+  geom_bar() + 
+  niceplot +
+  ylab("Number of unique species") +
+  xlab("Status") +
+  coord_flip() +
+  scale_fill_manual(values = custom_taxa_all, name = "")  +
+ theme(legend.text = element_text(size = 12),
+       legend.position = "right")
+ 
+fig_6
+
+
+ggsave("figures/Figure_6.tif", fig_6 , height = 6, width = 11, dpi = 300)
+
+# Reformat for ICES
+
+fig_6_ices <- fig_6 + theme(legend.key.size = unit(0.4, 'cm'),
+                            legend.text = element_text(size = 8),
+                            axis.text.x = element_text(size = 9),
+                            axis.text.y = element_text(size = 9),
+                            axis.title.x = element_text(size = 10),
+                            axis.title.y = element_text(size = 10))
+# Calculate the proportional height for a single-column figure
+# fig_width_mm <- 85
+# fig_height_mm <- (85 * 11) / 15
+
+# Calculate the proportional height for a double-column figure
+fig_width_mm <- 170
+fig_height_mm <- (170 * 6) / 11
+
+# Save the figure with the new dimensions
+ggsave("figures/Figure_6_ICES.tif",
+       fig_6_ices, 
+       width = fig_width_mm, 
+       height = fig_height_mm, 
+       units = "mm", 
+       dpi = 300)
+```
+
+
+```{r summary table with percentages}
+status_summary <- pws_alltarget_df %>% 
+  left_join(status_by_species, by = "species") %>%
+  filter(Abundance != 0 & kingdom == "Animalia" & is_good_match_98 == "yes" & !is.na(species)) %>%
+  distinct(species, final_status_pws) %>% 
+  mutate(updated_status = case_when(final_status_pws %in% c("Cryptogenic", "Cryptogenic in CA") ~ "Cryptogenic",
+                                    grepl("Native", final_status_pws) ~ "Native",
+                                    final_status_pws %in% c("Unresolved", "Unknown status - no occurrences in AK") ~ "Unresolved",
+                                    T ~ final_status_pws)) %>% 
+  tabyl(updated_status) %>% 
+  mutate(percent = 100*percent)
+```
+
+# Specific information for the introduced species
+
+## Representation in reference databases
+
+First, we want to quantify how many species are within each of the genus of introduced species. To count species within genus we used the downstream() function in taxize using the worms database and children down to species level.
+
+```{r how many species in each genus}
+introduced_spp <- sort(unique(introduced$species))
+introduced_genus <- str_split_fixed(introduced_spp, " ", 2)[,1]
+
+count_children <- function(introduced_genus){
+  thisresult <- downstream(introduced_genus, db ='worms', downto = "Species")
+  children <- thisresult[[1]]$name
+  n_species <- length(children)
+  return(n_species)
+}
+
+spp_in_genus <- data.frame(introduced_genus) %>% 
+  mutate(n_spp = map_int(introduced_genus, count_children))
+
+save(spp_in_genus, file = "temp-r-objects/spp_in_genus.R")
+```
+
+Second, we want to get an idea of and then how many barcodes are available, to get an idea of the representation. To assess representation we are compiling the number of species reported for each genus, then counting the number of sequences available for each genus and the number of different species available in each reference database.
+
+```{r load reference database taxonomy files}
+# load taxonomy files for the reference databases used
+
+# MLML 
+mlml_kt_taxonomy <- readRDS(file = "taxfiles/mlml_kt_taxonomy.rds") %>% 
+  dplyr::rename(sequence = seqs)  %>% 
+  dplyr::mutate(refdb = "mlml-kt")
+
+# BOLD
+bold_taxonomy <- readRDS(file = "taxfiles/BOLD_Public_06-Oct-2023_cleaned.rds")  %>% 
+  dplyr::mutate(refdb = "bold")
+
+# MIDORI
+load("taxfiles/midori_taxonomy_gb259.R")
+
+midori_taxonomy <- midori_taxonomy %>% 
+  dplyr::mutate(refdb = "midori")
+
+# Lavrador
+lavrador_taxonomy <- read.csv("taxfiles/lavrador_taxonomy_file.csv") %>% 
+  dplyr::select(-species) %>% 
+  dplyr::rename(species = species_gbif) %>% 
+  dplyr::mutate(refdb = "lavrador")
+```
+
+```{r how many sequences for each genus in each database}
+countSeqsByGenus <- function(genus_name, ref_database){
+  this_genus <- ref_database %>% 
+    filter(genus == genus_name) %>% 
+    nrow()
+  return(this_genus)
+}
+
+sequence_info <- spp_in_genus %>% 
+  mutate(n_seqs_midori = map_dbl(introduced_genus, ~ countSeqsByGenus(.x, ref_database = midori_taxonomy)),
+         n_seqs_bold = map_dbl(introduced_genus, ~ countSeqsByGenus(.x, ref_database = bold_taxonomy)),
+         n_seqs_mlml = map_dbl(introduced_genus, ~ countSeqsByGenus(.x, ref_database = mlml_kt_taxonomy)),
+         n_seqs_lavrador = map_dbl(introduced_genus, ~ countSeqsByGenus(.x, ref_database = lavrador_taxonomy)))
+
+
+```
+
+```{r how many species with sequences  in each database}
+countSppWithSeqs <- function(genus_name, ref_database){
+  spp_counts <- ref_database %>% 
+    filter(genus == genus_name) %>%
+    filter(!is.na(species)) %>% 
+    distinct(species) %>% 
+    nrow()
+  return(spp_counts)
+}
+
+spp_counts_info <- sequence_info %>% 
+  mutate(n_spp_midori = map_dbl(introduced_genus, ~countSppWithSeqs(.x, ref_database = midori_taxonomy)),
+         n_spp_bold = map_dbl(introduced_genus, ~countSppWithSeqs(.x, ref_database = bold_taxonomy)),
+         n_spp_mlml = map_dbl(introduced_genus, ~countSppWithSeqs(.x, ref_database = mlml_kt_taxonomy)),
+         n_spp_lavrador = map_dbl(introduced_genus, ~countSppWithSeqs(.x, ref_database = lavrador_taxonomy)),
+         target_species = case_when(grepl("Alitta", introduced_genus) ~ "Alitta succinea",
+                                    grepl("Amphibalanus", introduced_genus) ~ "Amphibalanus improvisus",
+                                    grepl("Limnoithona", introduced_genus ) ~ "Limnoithona tetraspina",
+                                    grepl("Marenzelleria", introduced_genus) ~ "Marenzelleria neglecta",
+                                    grepl("Monocorophium", introduced_genus) ~ "Monocorophium acherusicum",
+                                    grepl("Oithona", introduced_genus) ~ "Oithona davisae",
+                                    grepl("Philine", introduced_genus) ~ "Philine auriformis",
+                                    grepl("Pseudodiaptomus", introduced_genus) ~ "Pseudodiaptomus marinus",
+                                    T ~ "CHECK")) %>% 
+  relocate(target_species, .after = introduced_genus)
+         
+
+
+```
+
+```{r how many seqs for target species specifically}
+countTargetSppWithSeqs <- function(species_name, ref_database){
+  spp_counts <- ref_database %>% 
+    filter(species == species_name) %>%
+    nrow()
+  return(spp_counts)
+}
+
+final_info <- spp_counts_info %>% 
+  mutate(n_target_spp_midori = map_dbl(target_species, ~countTargetSppWithSeqs(.x, ref_database = midori_taxonomy)),
+         n_target_spp_bold = map_dbl(target_species, ~countTargetSppWithSeqs(.x, ref_database = bold_taxonomy)),
+         n_target_spp_mlml = map_dbl(target_species, ~countTargetSppWithSeqs(.x, ref_database = mlml_kt_taxonomy)),
+         n_target_spp_lavrador = map_dbl(target_species, ~countTargetSppWithSeqs(.x, ref_database = lavrador_taxonomy))) %>% 
+  dplyr::rename(Genus = introduced_genus,
+                Species = target_species)
+
+save(final_info, file = "results/final_representation_info.R")
+         
+```
+
+

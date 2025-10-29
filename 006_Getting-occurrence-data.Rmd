@@ -1,0 +1,316 @@
+---
+title: "Getting occurrences from GBIF and OBIS"
+author: "Brian Steves original code - Paula Pappalardo edits and customizing"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r markdown setup}
+library(knitr)
+
+# tidy options
+
+knitr::opts_chunk$set(echo = T, eval= F, warning = F, message = F, comment = "",
+                      tidy.opts = list(width.cutoff = 55), tidy = TRUE)
+```
+
+# Overview
+
+This file includes code to search for occurrence data in GBIF and OBIS databases for the species with good matches. R code to download OBIS and GBIF occurrences was provided by Brian Steves (Smithsonian Environmental Research Center). Paula organized Brian's code doing some edits, adding comments, and adding new code to summarize the raw occurrence data. Paula also researched how to identify occurrences that are likely from eDNA/metabarcoding samples and that should be removed from the dataset.
+
+How to identify and filter out the occurrences that may be from edna/metabarcoding studies?
+- column sampleSizeUnit == DNA sequence reads 
+- column basisOfRecord %in% c("MATERIAL_SAMPLE", "materialSample", "MaterialSample")
+
+```{r setup}
+library(rgbif)
+library(robis)
+library(dplyr)
+#library("tidylog", warn.conflicts = FALSE)
+library(readr)
+library(geosphere)
+library(readxl)
+library(phyloseq)
+library(speedyseq)
+library(sf)
+
+source("003a_Taxonomic-assignment-functions.R") # to get the match to GBIF function
+
+# create a folder to hold occurrence data
+dir.create("results/occurrences") 
+```
+
+```{r functions we need - from Brian Steves}
+in_bbox <- function(lat, lon, bbox) {
+  if (lat >= bbox[1] & lat <= bbox[2] & lon >= bbox[3] & lon <= bbox[4]) {
+    return(TRUE)
+  } else {
+    return(FALSE)
+  }
+}
+
+in_bb <- function(df) {
+  df$in_bb <- sapply(1:nrow(df), function(i) {
+    in_bbox(df$decimalLatitude[i], df$decimalLongitude[i], bbox)
+  })
+  return(df)
+}
+```
+
+## Define region of interest
+
+We need to define a bounding box for the state that we are interested in, so we can classify occurrence outsides or inside the state. We also want to define the main sampling location/area so that we can calculate the minimum distance (in km) from occurrences to sampling area.
+
+```{r define region of interest}
+#TODO: define your state
+state <- "AK" # options coded for AK and CA for now
+
+#TODO: define your city/main sampling point coordinates
+city <- "VDZ" 
+city_lon = -146.333731
+city_lat = 61.123731
+
+
+if (state == "CA"){
+  # California Bounding Box
+  bbox <- c(32.5, 42.0, -124.5, -114.0)
+  # San Francisco
+  city_coords <- matrix(c(-122.42, 37.77), ncol=2)
+}
+if (state == "AK"){
+  # Alaska Bounding Box
+  bbox <- c(51 ,72, -179, -129)
+  # Ketchikan or PWS
+  #KT
+  #city_coords <- matrix(c(-132.65, 55.34), ncol=2)
+  #PWS
+  city_coords <- matrix(c(-146.333731, 61.123731), ncol=2)
+}
+```
+
+Here we upload the list of species were are interested in:
+
+```{r species to search}
+# phyloseq datasets
+load("results/pws_goodmeta.R")
+
+# make dataframe with good metazoans
+df_goodmeta <- speedyseq::psmelt(pws_goodmeta)
+
+species_list <- df_goodmeta %>% 
+  filter(Abundance != 0 & !is.na(species)) %>% 
+  distinct(species) %>% 
+  arrange(species)
+
+# number of unique species with binomial names
+length(unique(species_list$species))
+```
+
+## Download occurrences 
+
+OBIS and GBIF occurrences were downloaded using the code below on April 17, 2025.
+
+```{r OBIS}
+# OBIS occs
+# get occurrence records from obis and append them to master obis output file
+# empty dataframe to hold results
+output_obis <- data.frame()
+# for loop to get occurrences for each species on the list
+for (i in 1:nrow(species_list)) {
+  #for (i in 1:4){
+  print(i)
+  sp <- species_list$species[i]
+  print(sp)
+  count <- 0
+  try(obis_dat <- occurrence(scientificname = sp), silent = TRUE)
+  count <- nrow(obis_dat)
+  #print(count)
+  if (count > 0){
+    if ('decimalLatitude' %in% names(obis_dat)){
+      # test for Alaska
+      obis_dat <- obis_dat %>% filter(!is.na(decimalLatitude), !is.na(decimalLongitude))
+      obis_dat <- in_bb(obis_dat)
+      obis_dat$out_species <- sp
+      print(unique(obis_dat$species))
+      output_obis <- bind_rows(output_obis, obis_dat)
+    }
+  }
+}
+
+
+
+```
+
+OBIS and GBIF taxonomy are almost identical, but OBIS uses the subgenera in some species names, so we need to convert the species name to match with GBIF backbone.
+
+```{r standarize OBIS names to GBIF}
+# get names to search on GBIF
+unique_names <- sort(unique(output_obis$species))
+sciname_matched <- matchToGBIF(unique_names)
+
+gbif_dictionary <- sciname_matched %>%
+  dplyr::select(verbatim_name, species) %>% 
+  dplyr::rename(species_gbif = species)
+
+output_obis <- output_obis %>% 
+  dplyr::left_join(gbif_dictionary, by = c("species" = "verbatim_name")) %>% 
+  dplyr::select(-species) %>% 
+  dplyr::rename(species = species_gbif)
+  
+
+save(output_obis, file = paste0("results/occurrences/obis_", state,"_occ_download_2025-04-21.R"))
+
+```
+
+
+```{r GBIF}
+# get occurrence records from gbif and append them to master gbif output file
+output_gbif <- data.frame()
+for (i in 1:nrow(species_list)) {
+  #for (i in 1:4){
+  #print(i)
+  sp <- species_list$species[i]
+  #print(sp)
+  count <- 0
+  try(gbif_dat <- occ_data(scientificName = sp, limit = 100000), silent = TRUE)
+  #print(gbif_dat$meta$count)
+  count <- gbif_dat$meta$count
+  if (count > 0) {
+    if ("decimalLatitude" %in% names(gbif_dat$data)) {
+      # test for California
+      gbif_dat$data <- gbif_dat$data %>% filter(!is.na(decimalLatitude), !is.na(decimalLongitude))
+      gbif_dat$data <- in_bb(gbif_dat$data)
+      gbif_dat$out_species <- sp
+      print(unique(gbif_dat$data$species))
+      output_gbif <- bind_rows(output_gbif, gbif_dat$data)
+      # GBIF has been getting stuck...save your progress to not loose all data
+      save(output_gbif, file = paste0("results/occurrences/gbif_", state,"_done-to-", sp, "_occ_download.R"))
+
+    }
+  }
+}
+
+#output <- output %>% dplyr::select(-networkKeys)
+save(output_gbif, file = paste0("results/occurrences/gbif_", state,"_occ_download_2025-04-17.R"))
+
+# summary table of how many occurrences per species
+out_tax_gbif <- output_gbif %>% group_by(species) %>% tally() %>% arrange(desc(n))
+```
+
+## Combine occurrence info
+
+First, we want to ignore all the occurrences without lat/lon information. Second, we want to check the basis of record columns to make sure we do not have fossils or video observations; I will actually preserve that info just in case. And then we want to calculate the distance of occurrence from our reference point (VDZ) and summarize occurrence data to species. For distance, we are using the _distHaversine()_ function that calculates the shortest distance between two points (i.e., the 'great-circle-distance' or 'as the crow flies'), according to the 'haversine method'. 
+
+
+```{r combine data}
+# load occurrence data if needed
+load("results/occurrences/obis_AK_occ_download_2025-04-21.R")
+load("results/occurrences/gbif_AK_occ_download_2025-04-17.R")
+
+# Do we have any useful status from occurrence data? (check column establishmentMeans and degreeOfEstablishment)
+# obis_with_status <- output_obis %>%
+#   filter(!is.na(decimalLatitude) & !is.na(decimalLongitude)) %>%
+#   filter(!is.na(establishmentMeans))
+# table(obis_with_status$establishmentMeans)
+# 
+# # Do we have any useful status from occurrence data? (check column establishmentMeans and degreeOfEstablishment)
+# gbif_with_status <- output_gbif %>%
+#   filter(!is.na(decimalLatitude) & !is.na(decimalLongitude)) %>%
+#   filter(!is.na(establishmentMeans))
+# table(gbif_with_status$establishmentMeans)
+
+# ------OBIS
+# separate coordinates for getting distance to reference points
+obis_filtered <- output_obis %>% #4542684
+  filter(!is.na(decimalLatitude) & !is.na(decimalLongitude)) %>% 
+  filter(sampleSizeUnit != "DNA sequence reads" | is.na(sampleSizeUnit)) %>% 
+  filter(!basisOfRecord %in% c("MATERIAL_SAMPLE", "materialSample", "MaterialSample"))  #4467184
+
+obis_coords <- obis_filtered  %>% select(decimalLongitude, decimalLatitude)
+obis_matrix <- matrix(c(obis_coords$decimalLongitude, obis_coords$decimalLatitude), ncol = 2) 
+
+# select final occurrences and add distance
+obis <- obis_filtered %>% 
+  mutate(obis_dist_vdz_km = distHaversine(city_coords, obis_coords) / 1000) %>% 
+  group_by(species) %>% 
+  summarize(obis_n = n(), obis_dist_vdz_km  = min(obis_dist_vdz_km ), obis_is_in_AK = any(in_bb), obis_countries =assign_unique(country), obis_type_records = assign_unique(basisOfRecord))
+
+# ------GBIF
+# separate coordinates for getting distance to reference points
+gbif_filtered <- output_gbif %>% # 1885663
+  filter(!is.na(decimalLatitude) & !is.na(decimalLongitude)) %>% 
+  filter(sampleSizeUnit != "DNA sequence reads" | is.na(sampleSizeUnit)) %>% 
+  filter(!basisOfRecord %in% c("MATERIAL_SAMPLE", "materialSample", "MaterialSample")) # 1695683
+
+gbif_coords <- gbif_filtered  %>% select(decimalLongitude, decimalLatitude)
+gbif_matrix <- matrix(c(gbif_coords$decimalLongitude, gbif_coords$decimalLatitude), ncol = 2) 
+
+# select final occurrences and add distance
+gbif <- gbif_filtered %>% 
+  mutate(gbif_dist_vdz_km = distHaversine(city_coords, gbif_coords) / 1000) %>% 
+  group_by(species) %>% 
+  summarize(gbif_n = n(), gbif_dist_vdz_km  = min(gbif_dist_vdz_km), gbif_is_in_AK = any(in_bb), gbif_countries = assign_unique(country), gbif_type_records = assign_unique(basisOfRecord))
+
+#------Combine occs
+summary_occs <- obis %>% 
+  full_join(gbif, by = c("species"))
+  
+write_csv(summary_occs, paste0("results/occurrences/summary_occs_", state, "_", Sys.Date(), ".csv"))
+
+```
+
+
+## Separating occurrences likely to be from metagenetics
+
+```{r separate occs from metagenetics}
+# # load occurrence data if needed
+# load("results/obis_AK_occ_download.R")
+# load("results/gbif_AK_occ_download.R")
+
+# ------OBIS
+# separate coordinates for getting distance to reference points
+obis_metagenetics <- output_obis %>% 
+  filter(!is.na(decimalLatitude) & !is.na(decimalLongitude)) %>% 
+  filter(sampleSizeUnit == "DNA sequence reads" | basisOfRecord %in% c("MATERIAL_SAMPLE", "materialSample", "MaterialSample")) %>% 
+  group_by(species) %>% 
+  summarize(obis_n = n(), obis_is_in_AK = any(in_bb), obis_countries = assign_unique(country), obis_type_records = assign_unique(basisOfRecord))
+
+# ------GBIF
+# separate coordinates for getting distance to reference points
+gbif_metagenetics <- output_gbif %>% 
+  filter(!is.na(decimalLatitude) & !is.na(decimalLongitude)) %>% 
+  filter(sampleSizeUnit == "DNA sequence reads" | basisOfRecord %in% c("MATERIAL_SAMPLE", "materialSample", "MaterialSample")) %>% 
+  group_by(species) %>% 
+  summarize(gbif_n = n(), gbif_is_in_AK = any(in_bb), gbif_countries = assign_unique(country), gbif_type_records = assign_unique(basisOfRecord))
+
+#------Combine occs
+summary_occs_metagenetics <- obis_metagenetics %>% 
+  full_join(gbif_metagenetics, by = c("species"))
+  
+save(summary_occs_metagenetics, file = paste0("results/occurrences/summary_occs_metagenetics_", state, "_", Sys.Date(), ".R"))
+
+```
+
+## Unique species to each database
+
+```{r contributions from each database}
+# load occurrence data if needed
+load("results/occurrences/obis_AK_occ_download_2025-04-21.R")
+load("results/occurrences/gbif_AK_occ_download_2025-04-17.R")
+load("results/occurrences/summary_occs_metagenetics_AK_2025-04-22.R")
+
+in_obis_not_gbif <- length(setdiff(output_obis$species, output_gbif$species)) # 5 from obis only
+in_obis_not_gbif
+in_gbif_not_obis <- length(setdiff(output_gbif$species, output_obis$species)) # 8 from gbif only
+in_gbif_not_obis
+
+
+```
+

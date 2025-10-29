@@ -1,0 +1,92 @@
+---
+title: "Create and filter phyloseq object"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r markdown setup}
+library(knitr)
+
+# tidy options
+
+knitr::opts_chunk$set(echo = T, eval= F, warning = F, message = F, comment = "",
+                      tidy.opts = list(width.cutoff = 55), tidy = TRUE)
+```
+
+# Overview
+
+Here we are going to do the final prep of information and build our phyloseq object using the merged ASV table and the merged mapping file. Then, we are going to filter out those samples that had issues and need to remove. 
+
+```{r setup}
+library(dplyr)
+library(phyloseq)
+library(phyloseqCompanion)
+library("tidylog", warn.conflicts = FALSE)
+```
+
+
+## Create phyloseq object
+
+To prepare the data to be used with *phyloseq* we need: 1) the ASV table, 2) the taxonomic IDs table, 3) the samples table (field metadata). The sample names and ASVs names must match across objects. 
+
+```{r transform data to phyloseq format}
+# ------ASVs
+
+# load merged ASV table
+seqtab_merged <- readRDS("filtered-seqtab/seqtab_nochim_filtered.rds")
+
+# convert to phyloseq format
+asvs <- otu_table(seqtab_merged, taxa_are_rows = FALSE)
+
+# ------Samples data
+
+# load merged mapping file
+load("metadata/mapping_all.R")
+
+# convert to phyloseq format
+samples <- mapping_all %>% 
+  tibble::column_to_rownames("sample_names") %>% 
+  sample_data(mapping_all)
+
+# -------Tax table
+
+# load final tax table
+load("results/alaska-pws_final_ids_2025-08-21.R")
+
+# format the tax table for phyloseq
+mat <- final_ids %>% as.matrix(.)
+rownames(mat) <- final_ids$seqs
+taxa_final <- tax_table(mat)
+
+# ------Merge data into phyloseq object
+pws <- merge_phyloseq(asvs, samples, taxa_final)
+pws
+# how many total reads
+sum(taxa_sums(pws))#37416498
+
+# change rownames and make sure they match
+load("filtered-seqtab/all_sequences_filtered-to-shortnames.R")
+
+names_ordered <- data.frame(seqs = taxa_names(pws)) %>%
+  left_join(trans_table, by = "seqs")
+
+taxa_names(pws) <- names_ordered$short_names
+
+# save phyloseq object
+saveRDS(pws, file = "results/pws_phyloseq.rds")
+
+#Are there any samples with no sequences?
+any(sample_sums(pws) == 0)#No
+#Are there any ASVs with no sequences?
+any(taxa_sums(pws) == 0)#No
+```
+
+

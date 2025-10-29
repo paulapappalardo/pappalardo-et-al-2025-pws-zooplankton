@@ -1,0 +1,141 @@
+---
+title: "iNEXT Accumulation Curves"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+## Acumulation curves
+
+```{r setup}
+library(iNEXT.3D)
+library(iNEXT.beta3D)
+library(tidyverse)
+library(phyloseq)
+library(speedyseq)
+library(lemon)
+library(flextable)
+library(officer)
+```
+
+
+### Estimators by location
+
+We want to calculate the richness estimators by location for good metazoans. 
+
+```{r curves by location - all locations}
+# read full dataset for coverage table
+load("results/pws_goodmeta.R")
+pws_genetic <- speedyseq::psmelt(pws_goodmeta)
+
+#good_98 <- pws_genetic %>%
+good_98 <- pws_genetic %>%
+  dplyr::rename(sample_names = Sample) %>% 
+  dplyr::filter(Abundance != 0 & year == 2021 & !is.na(species)) %>% 
+  dplyr::mutate(Tot = 1) %>% 
+  dplyr::distinct(phylum, sciname, location, sample_names, Tot) 
+
+# Summarize into number of samples per sample type
+pws_totals <- good_98 %>%
+    group_by(location) %>%
+    summarize(n_samples = n_distinct(sample_names)) 
+
+# Format data for iNEXT3D function
+pws_formatted <- good_98 %>%
+    pivot_wider(id_cols = sciname,
+                names_from = location, 
+                values_from = Tot, 
+                values_fn = length,
+                values_fill = 0) %>% 
+    mutate(total = rowSums(.[, 2:ncol(.)])) %>%  # Add column of total obs for each taxon to dataframe 
+   column_to_rownames(., var = "sciname") %>%
+    add_row(total = sum(pws_totals$n_samples),
+            CON = pws_totals$n_samples[which(pws_totals$location == "CON")],
+            VDZ = pws_totals$n_samples[which(pws_totals$location == "VDZ")],
+            VMT = pws_totals$n_samples[which(pws_totals$location == "VMT")],
+            .before = 1) %>% # Use add_row here to add first row to dataframe giving number of samples for each collector type / habitat
+    as.list(as.data.frame(.))
+
+pws_inext <- pws_formatted %>% 
+  iNEXT3D(., diversity = "TD", q = 0, datatype = "incidence_freq")
+
+```
+
+
+```{r summary table for location}
+# Original code for table from Andy Chang - Paula added some edits
+
+# Extract table of observed species richness and richness estimators ± SE
+inext_rich_est <- pws_inext$TDAsyEst  %>%  filter(qTD == "Species richness")
+
+# Extract table of sample coverage estimators
+inext_rich_cov <- pws_inext$TDiNextEst$coverage_based |> filter(Method == "Observed")
+
+### Richness Estimators
+
+# Round to 2 decimal places, add column for number of panels, rename s.e. column
+est_all <- inext_rich_est |>
+  dplyr::rename(
+    "Observed" = "TD_obs",
+    "SE" = "s.e.",
+    "Estimator" = "TD_asy",
+    "LCL" = "qTD.LCL",
+    "UCL" = "qTD.UCL") |>
+  dplyr::mutate(Panels = 55) |>
+  dplyr::mutate_at(
+    c(
+      "Estimator",
+      "SE",
+      "LCL",
+      "UCL"
+    ),
+    round,
+    2
+  )
+
+### Sample Coverage Estimators
+
+# Round to 2 decimal places, add column for number of panels, rename s.e. column
+cov_all <- inext_rich_cov |>
+  dplyr::rename("LCL" = "qTD.LCL",
+                "UCL" = "qTD.UCL") |>
+  dplyr::mutate(SC = (100 * SC)) |>
+  dplyr::mutate_at(
+    c(
+      "SC",
+      "LCL",
+      "UCL"
+    ),
+    round,
+    2
+  )
+
+### Add sample coverage estimator to richness estimator dataframe
+est_all <- est_all |>
+  left_join(dplyr::select(cov_all, c("SC", "Assemblage")), by = c("Assemblage"))
+
+
+est_pws23 <-  est_all |>
+  dplyr::rename("Type" = "Assemblage") |>
+  arrange(Type) |>
+  dplyr::mutate(
+    qTD = NULL,
+    Panels = NULL,
+  ) |>
+  mutate(Type = case_when(
+    Type == "total" ~ "Total",
+    T ~ Type))
+
+coverage_bylocation <- est_pws23 |>
+  flextable() |>
+  autofit()
+
+save_as_docx(coverage_bylocation, path ="tables/Table_5_iNEXT-estimators_Location-dataset.docx")
+```
+

@@ -1,0 +1,435 @@
+---
+title: "Removing contaminants and non target - subsetting datasets for analysis"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+
+```{r markdown setup}
+library(knitr)
+
+# tidy options
+
+knitr::opts_chunk$set(echo = T, eval= F, warning = F, message = F, comment = "",
+                      tidy.opts = list(width.cutoff = 55), tidy = TRUE)
+```
+
+# Overview
+
+Here we are going to split the data by runs to inspect for contaminants, and remove them (if needed). We also filter the different datasets used for analysis and create the summary table for each.
+
+```{r setup}
+library(dplyr)
+library(phyloseq)
+library(speedyseq)
+library(decontam)
+library(janitor)
+library(flextable)
+library(officer)
+library("tidylog", warn.conflicts = FALSE)
+
+source("005a_Removing-contaminants-and-non-target-functions.R") 
+```
+
+# Load data
+
+```{r load and split by run}
+# load phyloseq object
+pws <- readRDS(file = "results/pws_phyloseq.rds")
+
+run_5_phyloseq <- subset_samples(pws, run_name == "run-5_2022_L1-337123789") %>%
+  prune_samples(sample_sums(.) > 0, .) %>%
+  prune_taxa(taxa_sums(.) > 0, .) 
+  
+run_6_phyloseq <- subset_samples(pws, run_name == "run-6_2022_L2-338222904") %>%
+  prune_samples(sample_sums(.) > 0, .) %>%
+  prune_taxa(taxa_sums(.) > 0, .) 
+
+run_7_phyloseq <- subset_samples(pws, run_name == "run-7_2022_L3-338586546") %>%
+  prune_samples(sample_sums(.) > 0, .) %>%
+  prune_taxa(taxa_sums(.) > 0, .) 
+
+all_other_runs <- subset_samples(pws,!(run_name %in% c("run-5_2022_L1-337123789", "run-6_2022_L2-338222904", "run-7_2022_L3-338586546"))) %>%
+  prune_samples(sample_sums(.) > 0, .) %>%
+  prune_taxa(taxa_sums(.) > 0, .) 
+```
+
+# Identify contaminants
+
+__Run 5__: These ASVs were identified by decontam R package as contaminants: ASV_2, ASV_3, ASV_4, ASV_10, ASV_13, ASV_16, ASV_18, ASV_25, ASV_28, ASV_33, ASV_35, ASV_266. After inspecting each:
+
+- ASVs very abundant in many samples: 2, 3, 4, 10, 13, 28, 35
+- ASV abundant in many samples: 16, 18, 33
+- ASV in low abundance but in several samples: 266
+
+ASV_49 belonging to Pseudocalanus minutus was identified as a TRUE contaminant by decontam analysis, but that species was identified also by other ASVs so will not dissapear. Was also identified in run 6 and 7.
+
+
+```{r run 5}
+# convert phyloseq object to dataframe
+run_5_df <- speedyseq::psmelt(run_5_phyloseq)
+
+# subset the taxa in the NTC control to inspect it
+run_5_ntc <- run_5_df %>% filter(Ext_control == "Y"  & Abundance != 0)
+
+# to check abundance in the rest of the sample
+View(run_5_df %>% filter(query_seqid == "ASV_49" & Abundance != 0))
+
+#Following protocol to identify contaminants in dataset using "prevalence" method since this dataset had controls
+sample_data(run_5_phyloseq)$is.neg <- sample_data(run_5_phyloseq)$Ext_control == "Y"
+contamdf.prev_5 <- isContaminant(run_5_phyloseq, method="prevalence", neg="is.neg", threshold = 0.5)
+table(contamdf.prev_5$contaminant)
+#FALSE  TRUE 
+# 4669    12 
+# which ASV? #ASV_49
+View(contamdf.prev_5 %>% filter(contaminant == TRUE) %>% distinct(rownames(.)))
+
+rm(run_5, run_5_df, run_5_ntc, contamdf.prev_5)
+```
+
+__Run 6__: These ASVs were identified by decontam R package as contaminants: ASV_525. Interestingly, some of the ASVs identified as contaminants in run 5 were found in the run 6 control:  ASV_2, ASV_3, ASV_4, ASV_10, ASV_13, ASV_16, ASV_18, ASV_25, ASV_28, ASV_33, ASV_35, together with other ASVs.
+
+- ASVs very abundant in many samples: 
+- ASV abundant in many samples: 
+- ASV in low abundance but in several samples: 
+
+ASV_525 belonging to Bougainvillia_superciliaris was identified as true contaminant by decontam analysis of run 6, but that species itself was identified in other ASVs so will still be represented, and was also present in some samples of run 5.
+
+```{r run 6}
+# convert phyloseq object to dataframe
+run_6_df <- speedyseq::psmelt(run_6_phyloseq)
+
+# subset the taxa in the NTC control to inspect it
+run_6_ntc <- run_6_df %>% filter(Ext_control == "Y"  & Abundance != 0)
+
+# to check abundance in the rest of the sample
+View(run_6_df %>% filter(query_seqid == "ASV_525" & Abundance != 0)) # ASV_525 was identified as true contaminant
+
+#Following protocol to identify contaminants in dataset using "prevalence" method since this dataset had controls
+sample_data(run_6_phyloseq)$is.neg <- sample_data(run_6_phyloseq)$Ext_control == "Y"
+contamdf.prev_6 <- isContaminant(run_6_phyloseq, method="prevalence", neg="is.neg", threshold = 0.5)
+table(contamdf.prev_6$contaminant)
+# FALSE  TRUE 
+#  1895     1 
+# which ASV? #ASV_49
+View(contamdf.prev_6 %>% filter(contaminant == TRUE) %>% distinct(rownames(.)))
+
+rm(run_6, run_6_df, run_6_ntc, contamdf.prev_6)
+```
+
+__Run 7__: According to decontam, there are two TRUE contaminats in this run, ASV_2751 (is a fish Paralichthys dentatus also represented in low abundance by another ASV, does not appear in the other runs) & ASV_5643 (is Americamysis bigelowi and it is only represented in the EC and one of the redo samples, does not appear in the other runs)
+ASV 1, 2, 4, and 18 also appeared in this control.
+
+```{r run 7}
+# convert phyloseq object to dataframe
+run_7_df <- speedyseq::psmelt(run_7_phyloseq)
+
+# subset the taxa in the NTC control to inspect it
+run_7_ntc <- run_7_df %>% filter(Ext_control == "Y"  & Abundance != 0)
+
+# to check abundance in the rest of the sample
+View(run_7_df %>% filter(query_seqid == "ASV_5643" & Abundance != 0))
+
+#Following protocol to identify contaminants in dataset using "prevalence" method since this dataset had controls
+sample_data(run_7_phyloseq)$is.neg <- sample_data(run_7_phyloseq)$Ext_control == "Y"
+contamdf.prev_7 <- isContaminant(run_7_phyloseq, method="prevalence", neg="is.neg", threshold = 0.5)
+table(contamdf.prev_7$contaminant)
+#FALSE  TRUE 
+# 1703     2 
+# which ASV? #ASV_2751, ASV_5643
+View(contamdf.prev_7 %>% filter(contaminant == TRUE) %>% distinct(rownames(.)))
+
+
+rm(run_7, run_7_df, run_7_ntc, contamdf.prev_7)
+```
+
+
+# Final filters
+
+For our final filter we are:
+1) removing ASVs that were flagged as contaminants from their respective runs (and then combining all runs again)
+2) removing non target taxa (e.g., Insecta)
+3) removing defective runs (the ones with less than 10,000 reads)
+
+```{r recombine data and save}
+# remove true contaminants from each phyloseq object separated by run
+run_5_phyloseq_nocontams <- run_5_phyloseq %>% 
+  phyloseq::subset_taxa(., !(query_seqid %in% c("ASV_49"))) %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+  
+run_6_phyloseq_nocontams <- run_6_phyloseq %>% 
+  phyloseq::subset_taxa(., !(query_seqid %in% c("ASV_525"))) %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+
+run_7_phyloseq_nocontams <- run_7_phyloseq %>% 
+  phyloseq::subset_taxa(., !(query_seqid %in% c("ASV_2751", "ASV_5643"))) %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+
+# -----Additional filters
+
+# Keep only metazoans with good matches (>=98%) and remove non target
+pws_alltarget <- merge_phyloseq(run_5_phyloseq_nocontams, run_6_phyloseq_nocontams, run_7_phyloseq_nocontams, all_other_runs) %>% 
+  # remove samples done with a different primer
+  phyloseq::subset_samples(., !(run_name %in% c("run-1_Valdez2017_ml", "run-0_2016intCOIml"))) %>%
+  # remove controls
+  phyloseq::subset_samples(., Ext_control != "Y" | is.na(Ext_control)) %>% 
+  # remove non target taxa
+  phyloseq::subset_taxa(., !(class %in% c("Aves", "Insecta", "Collembola", "Mammalia", "Symphyla", "Pauropoda", "Diplopoda","Chilopoda","Arachnida"))) %>%
+  # remove defective samples
+  phyloseq::subset_samples(., sample_n_reads >= 10000) %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+
+# check for non target organisms (running partially the object above)
+# pws_test <- speedyseq::psmelt(pws_alltarget)
+# pws_tocheck <- pws_test %>% 
+#   filter(Abundance != 0) %>% 
+#   filter(class %in% c("Aves", "Insecta", "Collembola", "Mammalia", "Symphyla", "Pauropoda", "Diplopoda","Chilopoda","Arachnida")) %>% 
+#   mutate(percent_identity = as.numeric(percent_identity))
+
+# check these before the last two prune commands (just to know)
+#Are there any samples with no sequences?
+any(sample_sums(pws_alltarget) == 0)#No
+# #Are there any ASVs with no sequences?
+any(taxa_sums(pws_alltarget) == 0)#No
+
+# how many total reads on final all target dataset
+sum(taxa_sums(pws_alltarget)) #34223069
+
+# save filtered datasets
+save(pws_alltarget , file = "results/pws_alltarget.R")
+
+
+rm(run_5_phyloseq_nocontams, run_6_phyloseq_nocontams, run_7_phyloseq_nocontams, all_other_runs, run_5_phyloseq, run_6_phyloseq, run_7_phyloseq)
+```
+
+We can make a table of final reads per kingdom for the main manuscript
+
+```{r final tax summary for text}
+pws_alltarget_df <- speedyseq::psmelt(pws_alltarget)
+
+kingdom_counts <- pws_alltarget_df %>% 
+  filter(Abundance != 0) %>% 
+  distinct(OTU, kingdom) %>% 
+  tabyl(kingdom) %>% 
+  adorn_totals("row") %>%
+  adorn_pct_formatting()
+```
+
+
+# Parse and summarize different datasets for analysis
+
+Here the goal is to subset different phyloseq objects for each type of analysis.
+
+```{r subset different datasets}
+# load mapping file
+load("metadata/mapping_all.R")
+
+# -------Only good metazoans
+pws_goodmeta <- pws_alltarget %>% 
+  phyloseq::subset_taxa(., kingdom == "Animalia" & is_good_match_98 == "yes" & !is.na(phylum)) %>%
+  simplifyTaxTable(.) %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+save(pws_goodmeta, file = "results/pws_goodmeta.R")
+
+# make a dataframe of the metazoans dataset
+goodmeta_df <- speedyseq::psmelt(pws_goodmeta)
+
+# separate the 2021 species with binomial names to check reviewer question
+goodmeta_binoms <- goodmeta_df %>%
+  filter(Abundance !=0 & !is.na(species) & year == 2021)
+
+# cross check with the numbers from iNEXT script
+# setdiff(good_98$sciname, goodmeta_binoms$species)
+# setdiff(goodmeta_binoms$species, good_98$sciname)
+
+# check number by location
+# n_by_location <- goodmeta_binoms %>% 
+#   distinct(species, location) %>% 
+#   group_by(location) %>%
+#   add_count() %>% 
+#   distinct(location, n)
+
+# -------Temporal analysis
+# the best month for a temporal comparison across years is May
+# the only common location across years was VMT, but two VMT for 2021 failed
+# so complement 1 VMT with 3 random from VDZ for Week7 that matches historical sampling
+tokeep2021_VDZ <- mapping_all %>% filter(year == 2021 & month == "May" & location == "VDZ" & Week == "Week7") %>% head(., n = 3)
+tokeep2021_VMT <- mapping_all %>% filter(year == 2021 & month == "May" & location == "VMT")
+tokeepHistorical <- mapping_all %>% filter(year != 2021 & month == "May" & location == "VMT" & primer_forward != "mICOIintF")
+samples_to_keep <- c(tokeep2021_VDZ$sample_names, tokeep2021_VMT$sample_names, tokeepHistorical$sample_names)
+
+pws_temporal <- pws_goodmeta %>% # good metazoans with 98% identity
+  phyloseq::subset_samples(., month == "May" & sample_number %in% samples_to_keep) %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+save(pws_temporal, file = "results/pws_temporal.R")
+
+# -------By Tide
+pws_tide <- pws_goodmeta %>% # good metazoans with 98% identity
+  phyloseq::subset_samples(., EbbvSlack == "Y") %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+save(pws_tide, file = "results/pws_tide.R")
+
+# -------By Day vs Night
+pws_day_night <- pws_goodmeta %>% # good metazoans with 98% identity
+  phyloseq::subset_samples(., DvN == "Y") %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+save(pws_day_night, file = "results/pws_day_night.R")
+
+# -------By location
+pws_con <- pws_goodmeta %>% # good metazoans with 98% identity
+  phyloseq::subset_samples(., location == "CON" & year == 2021) %>% 
+  phyloseq::subset_samples(., is.na(DvN)) %>%
+  phyloseq::subset_samples(., is.na(EbbvSlack)) %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+save(pws_con, file = "results/pws_con.R")
+
+pws_vdz <- pws_goodmeta %>% # good metazoans with 98% identity
+  phyloseq::subset_samples(., location == "VDZ" & year == 2021) %>% 
+  phyloseq::subset_samples(., is.na(DvN)) %>%
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+save(pws_vdz, file = "results/pws_vdz.R")
+
+pws_vmt <- pws_goodmeta %>% # good metazoans with 98% identity
+  phyloseq::subset_samples(., location == "VMT" & year == 2021) %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+
+save(pws_vmt, file = "results/pws_vmt.R")
+
+pws_allthree <- pws_goodmeta %>% # good metazoans with 98% identity
+  phyloseq::subset_samples(., All3 == "Y" & year == 2021) %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) 
+
+save(pws_allthree, file = "results/pws_allthree.R")
+
+```
+```{r reviewer question - stats on number of ASVs per taxa}
+stats_asvs <- pws_goodmeta %>% 
+  speedyseq::psmelt() %>% 
+  filter(Abundance != 0 & !is.na(species)) %>% 
+  group_by(species) %>%
+  add_count(species) %>% 
+  distinct(phylum, species, n) %>% 
+  arrange(desc(n))
+  
+
+stats_asvs <- pws_goodmeta %>% 
+  speedyseq::psmelt() %>% 
+  filter(Abundance != 0 & !is.na(species)) %>% 
+  group_by(phylum, species) %>%
+  summarize(n_asvs = length(unique(OTU))) %>% 
+  distinct(phylum, species, n_asvs) %>% 
+  arrange(desc(n_asvs))
+
+
+p_mimus <- pws_goodmeta %>% 
+  speedyseq::psmelt() %>% 
+  filter(Abundance != 0 & species == "Pseudocalanus mimus")
+```
+
+
+## Create Table S5
+
+
+```{r table S5}
+# number of reads
+reads_goodmeta <- sum(taxa_sums(pws_goodmeta))
+reads_CON <- sum(taxa_sums(pws_con))
+reads_VDZ <- sum(taxa_sums(pws_vdz))
+reads_VMT <- sum(taxa_sums(pws_vmt))
+reads_day_night <- sum(taxa_sums(pws_day_night))
+reads_tide <- sum(taxa_sums(pws_tide))
+reads_allthree <- sum(taxa_sums(pws_allthree))
+reads_temporal <- sum(taxa_sums(pws_temporal))
+
+# number of samples
+samples_goodmeta <-  nrow(sample_data(pws_goodmeta))
+samples_CON <-  nrow(sample_data(pws_con))
+samples_VDZ <-  nrow(sample_data(pws_vdz))
+samples_VMT <-  nrow(sample_data(pws_vmt))
+samples_day_night <-  nrow(sample_data(pws_day_night))
+samples_tide <-  nrow(sample_data(pws_tide))
+samples_allthree <-  nrow(sample_data(pws_allthree))
+samples_temporal <-  nrow(sample_data(pws_temporal))
+
+# number of ASVs
+asvs_goodmeta <- nrow(tax_table(pws_goodmeta))
+asvs_CON <-  nrow(tax_table(pws_con))
+asvs_VDZ <-  nrow(tax_table(pws_vdz))
+asvs_VMT <-  nrow(tax_table(pws_vmt))
+asvs_day_night <-  nrow(tax_table(pws_day_night))
+asvs_tide <-  nrow(tax_table(pws_tide))
+asvs_allthree <-  nrow(tax_table(pws_allthree))
+asvs_temporal <-  nrow(tax_table(pws_temporal))
+
+# number of unique taxa
+
+taxa_goodmeta <-  length(unique(taxa.data.frame(pws_goodmeta)$sciname))
+taxa_CON <-  length(unique(taxa.data.frame(pws_con)$sciname))
+taxa_VDZ <-  length(unique(taxa.data.frame(pws_vdz)$sciname))
+taxa_VMT <-  length(unique(taxa.data.frame(pws_vmt)$sciname))
+taxa_day_night <-  length(unique(taxa.data.frame(pws_day_night)$sciname))
+taxa_tide <-  length(unique(taxa.data.frame(pws_tide)$sciname))
+taxa_allthree <-  length(unique(taxa.data.frame(pws_allthree)$sciname))
+taxa_temporal <-  length(unique(taxa.data.frame(pws_temporal)$sciname))
+
+onlyBinoms <- function(mydf){
+  mydf_ed <- mydf %>% filter(!(species %in% c(NA, "NA", "")))
+  return(mydf_ed)
+}
+
+# number of unique species
+spp_goodmeta <-  length(unique(onlyBinoms(taxa.data.frame(pws_goodmeta))$species))
+spp_CON <-  length(unique(onlyBinoms(taxa.data.frame(pws_con))$species))
+spp_VDZ <-  length(unique(onlyBinoms(taxa.data.frame(pws_vdz))$species))
+spp_VMT <-  length(unique(onlyBinoms(taxa.data.frame(pws_vmt))$species))
+spp_day_night <-  length(unique(onlyBinoms(taxa.data.frame(pws_day_night))$species))
+spp_tide <-  length(unique(onlyBinoms(taxa.data.frame(pws_tide))$species))
+spp_allthree <-  length(unique(onlyBinoms(taxa.data.frame(pws_allthree))$species))
+spp_temporal <-  length(unique(onlyBinoms(taxa.data.frame(pws_temporal))$species))
+
+# compile all answers
+mytabledf <- data.frame(Dataset = c("Metazoans", "CON", "VDZ", "VMT", "Day/Night", "Tide", "All locations", "Temporal"),
+                        Samples = c(samples_goodmeta, samples_CON, samples_VDZ, samples_VMT, samples_day_night, samples_tide, samples_allthree, samples_temporal),
+                        Reads = c( reads_goodmeta, reads_CON, reads_VDZ, reads_VMT, reads_day_night, reads_tide, reads_allthree, reads_temporal),
+                        ASVs = c( asvs_goodmeta, asvs_CON, asvs_VDZ, asvs_VMT, asvs_day_night, asvs_tide, asvs_allthree, asvs_temporal),
+                        Taxa = c( taxa_goodmeta, taxa_CON, taxa_VDZ, taxa_VMT, taxa_day_night, taxa_tide, taxa_allthree, taxa_temporal),
+                        Species = c( spp_goodmeta, spp_CON, spp_VDZ, spp_VMT, spp_day_night, spp_tide, spp_allthree, spp_temporal))
+
+# setup font defaults
+set_flextable_defaults(font.size = 10)
+
+table_s5 <- qflextable(mytabledf) %>% 
+  #rotate(., j = 3:16, align = "bottom", rotation = "btlr", part = "header") %>% 
+  #width(., width = 1) %>%
+  #theme_zebra() %>% 
+  fit_to_width(., max_width = 7)
+
+save(table_s5, file = "tables/Table_S5_Datasets-details.R")
+save_as_docx(table_s5, path = "tables/Table_S5_Datasets-details.docx")
+```
+

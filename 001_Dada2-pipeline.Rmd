@@ -1,0 +1,1354 @@
+---
+title: "Dada 2 pipeline"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r knitting setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = F,
+                      comment = "",
+                      tidy.opts = list(width.cutoff = 55),
+                      tidy = T)
+```
+
+# Overview
+
+The code in this document includes the scripts to run all of the dada2 pipeline to generate ASVs for each different run. The filtering parameters for each run were optimized based on quality plots. Before running dada2, primers were trimmed using cutadapt. We initially analyzed eight runs but two of them (run-0_2016intCOIml and run-1_Valdez2017_ml) were sequenced with different primers. For this manuscript, we used the six sequencing runs (three from historical samples and three with all 2021 targeted sampling data) that were sequenced with the same primer. Run_0 and run_1 are filtered out from the analysis in follow-up scripts.
+
+Historical data:
+
+* run-0_2016intCOIml - NOT INCLUDED IN THE FINAL MANUSCRIPT
+* run-1_Valdez2017_ml - NOT INCLUDED IN THE FINAL MANUSCRIPT
+* run-2_Valdez2017_fb
+* run-3_Valdez2018
+* run-4_Valdez2019
+
+Targeted 2021 sampling:
+
+* run-5_2022_L1-337123789
+* run-6_2022_L2-338222904
+* run-7_2022_L3-338586546
+
+Most R code was taken from the dada2 online tutorials + tiny improvements/optimization by Paula Pappalardo adding additional code for visualization and saving intermediate files and specific quality/error plots.
+
+Details:
+- the input are fastq (or fastq.gz) files with reads from high throughput sequencing
+- the script cleans and filter reads to generate a sequence table
+- the script provides figures useful for QC and data checks
+- the script saves all intermediate objects for troubleshooting if needed
+
+## Primer trimming
+
+We used the following bash script to trim primers from the raw reads:
+
+```{r bash - cutadapt script for ml primer, eval = F}
+mkdir trimmed
+
+for f in $(ls -1 *R1_001.fastq|sed 's/\_R1_001.fastq//')
+do
+cutadapt -g file:cutadapt_mlCOIintF.fa \
+ -G file:cutadapt_jgCOI.fa \
+ -o trimmed/"$f"_R1_001_trim.fastq \
+ -p trimmed/"$f"_R2_001_trim.fastq "$f"_R1_001.fastq "$f"_R2_001.fastq \
+ -O 10 \
+ -e 0.1 \
+ --discard-untrimmed \
+ --pair-filter=any \
+ --minimum-length 50 \
+ --trim-n
+
+
+done
+
+```
+
+```{bash - cutadapt script for fb primer, eval = F}
+mkdir trimmed
+
+for f in $(ls -1 *R1_001.fastq|sed 's/\_R1_001.fastq//')
+do
+cutadapt -g file:cutadapt_fbCOI.fa \
+ -G file:cutadapt_jgCOI.fa \
+ -o trimmed/"$f"_R1_001_trim.fastq \
+ -p trimmed/"$f"_R2_001_trim.fastq "$f"_R1_001.fastq "$f"_R2_001.fastq \
+ -O 10 \
+ -e 0.1 \
+ --discard-untrimmed \
+ --pair-filter=any \
+ --minimum-length 50 \
+ --trim-n
+
+done
+```
+
+## Dada2 pipeline
+
+```{r setup}
+# load libraries
+
+library(dada2); packageVersion("dada2")
+library(ggplot2)
+library(tidyverse)
+
+# string manipulation to get sample names from file names
+
+get.sample.name <- function(fname){
+  strsplit(basename(fname), "_")[[1]][1] # Assumes filename = sampleNumber_otherInfo.fastq
+} 
+```
+
+## Quality plots to optimize parameters
+
+We ran the script below for each run to generate exploratory quality plots and optimize the trunLen parameters based on read quality.
+
+```{r loop over run folder names - read data and generate exploratory quality plots}
+#-------------- Data we need
+
+# define your folder name 
+
+folder_name = "run-7_2022_L3-338586546"
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+
+fnFs <- sort(list.files(folder_name, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(folder_name, pattern="_R2_001.fastq", full.names = TRUE))
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+sample.namesR <- unname(sapply(cutRs, get.sample.name))
+if(!identical(sample.names, sample.namesR)) stop("Forward and reverse files do not match.")
+
+# check it looks ok
+head(sample.names)
+
+# ---------Check the quality of reads in the sequences with and without the primers
+
+fnFs_plot <- plotQualityProfile(fnFs[1:9])
+fnRs_plot <- plotQualityProfile(fnRs[1:9])
+cutFs_plot <- plotQualityProfile(cutFs[1:9])
+cutRs_plot <- plotQualityProfile(cutRs[1:9])
+
+# zoom into bad tails to estimate truncLen
+cutFs_plot_xlim200 <- cutFs_plot + coord_cartesian(xlim = c(200, 300), expand = F)
+cutFs_plot_xlim250 <- cutFs_plot + coord_cartesian(xlim = c(250, 300), expand = F)
+cutRs_plot_xlim200 <- cutRs_plot + coord_cartesian(xlim = c(200, 300), expand = F)
+cutRs_plot_xlim250 <- cutRs_plot + coord_cartesian(xlim = c(250, 300), expand = F)
+
+ggsave(paste("figures/quality-plots/", folder_name, "_fnFs_plot.pdf", sep = ""), fnFs_plot, width = 12, height = 11, dpi = 300)
+ggsave(paste("figures/quality-plots/", folder_name, "_fnRs_plot.pdf", sep = ""), fnRs_plot, width = 12, height = 11, dpi = 300)
+ggsave(paste("figures/quality-plots/", folder_name, "_cutFs_plot.pdf", sep = ""), cutFs_plot, width = 12, height = 11, dpi = 300)
+ggsave(paste("figures/quality-plots/", folder_name, "_cutRs_plot.pdf", sep = ""), cutRs_plot, width = 12, height = 11, dpi = 300)
+
+ggsave(paste("figures/quality-plots/", folder_name, "_cutFs_200_plot.pdf", sep = ""), cutFs_plot_xlim200 , width = 12, height = 11, dpi = 300)
+ggsave(paste("figures/quality-plots/", folder_name, "_cutRs_200_plot.pdf", sep = ""), cutRs_plot_xlim200 , width = 12, height = 11, dpi = 300)
+ggsave(paste("figures/quality-plots/", folder_name, "_cutFs_250_plot.pdf", sep = ""), cutFs_plot_xlim250 , width = 12, height = 11, dpi = 300)
+ggsave(paste("figures/quality-plots/", folder_name, "_cutRs_250_plot.pdf", sep = ""), cutRs_plot_xlim250, width = 12, height = 11, dpi = 300)
+
+
+```
+
+## Dada2 pipeline
+
+```{r run0 - dada2 with optimized parameters}
+#-------------- Data we need
+
+# define your folder name 
+
+folder_name = "run-0_2016intCOIml"
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(270, 220)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+
+# use sample names as names
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/",folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/",folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""), row.names = F) 
+```
+
+```{r run1 - dada2 with optimized parameters}
+# define folder name 
+folder_name = "run-1_Valdez2017_ml"
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(260, 220)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+
+# use sample names as names
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/", folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/", folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""),row.names = F) 
+```
+
+```{r run2 - dada2 with optimized parameters}
+# define folder name to identify this run
+folder_name = "run-2_Valdez2017_fb"
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(260, 200)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+
+# use sample names as names
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/",folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/",folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""),row.names = F) 
+```
+
+```{r run3 - dada2 with optimized parameters}
+# define folder name to identify this run
+folder_name = "run-3_Valdez2018"
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(250, 200)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+
+# use sample names as names
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/",folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/",folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""),row.names = F) 
+```
+
+```{r run4 - dada2 with optimized parameters}
+# define folder name to identify this run
+folder_name = "run-4_Valdez2019"
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(270, 225)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+
+# use sample names as names
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/", folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/", folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""),row.names = F) 
+```
+
+```{r run5 - dada2 with optimized parameters}
+# define folder name to identify this run
+folder_name = "run-5_2022_L1-337123789"
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(250, 200)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+
+# use sample names as names
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/", folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/", folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""),row.names = F) 
+```
+
+```{r run6 - dada2 with optimized parameters}
+# define folder name to identify this run
+folder_name = "run-6_2022_L2-338222904"
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(265, 200)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(cutFs, get.sample.name))
+
+# use sample names as names
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/", folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/", folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""),row.names = F) 
+```
+
+```{r run7 - dada2 with optimized parameters}
+# define folder name to identify this run
+folder_name = "run-7_2022_L3-338586546"
+
+# Path to trimmed reads (primer removed using cutadapt on independent step)
+
+path = paste(folder_name, "/trimmed", sep = "")
+
+# Read the trimmed sequence files in
+
+cutFs <- sort(list.files(path, pattern = "_R1_001_trim.fastq", full.names = TRUE))
+cutRs <- sort(list.files(path, pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+#-------------- Filter and trim (trimming done separately with cutadapt)
+# define filtering parameters for dada2 based on a quick run with quality plots
+# so run script up to the quality plot, check tails, decide on best trimming, and modify here before full run
+mytruncLen = c(265, 220)
+mymaxEE = c(2,2) # chosen based on Paula's check of literature, some testing, and our goal of hopefully accurate IDs
+
+# Place primer trimmed, filtered files in filtered/ subdirectory, to be stored as fastq.gz files
+
+filtFs <- file.path(folder_name, "filtered", basename(cutFs))
+filtRs <- file.path(folder_name, "filtered", basename(cutRs))
+
+# Note that mytrunLen and mymaxEE were defined at the beggining of the script
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs,
+                     truncLen = mytruncLen,
+                      maxN = 0, #(Optional). Default 0. After truncation, sequences with more than maxN Ns will be discarded.
+                      maxEE = mymaxEE, #(Optional). Default Inf. After truncation, reads with higher than maxEE "expected errors" will be discarded
+                      truncQ = 2, #(Optional). Default 2. Truncate reads at the first instance of a quality score less than or equal to truncQ.
+                      minLen = 50, #(Optional). Default 20. Remove reads with length less than minLen.
+                      rm.phix = TRUE, #(Optional). Default TRUE. If TRUE, discard reads that match against the phiX genome
+                      compress = TRUE, #(Optional). Default TRUE. If TRUE, the output fastq file(s) are gzipped.
+                      multithread = T #Default is FALSE. If TRUE, input files are filtered in parallel via mclapply. If an integer is provided, it is passed to the mc.cores argument of mclapply.
+)
+
+# save out object for tracking purposes
+save(out, file = paste("dada2/", folder_name, "_out.R", sep = ""))
+
+
+#-------------- Error inference
+
+# Read the trimmed and filtered sequence files in
+
+filtFs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R1_001_trim.fastq", full.names = TRUE))
+filtRs <- sort(list.files(path = paste(folder_name, "/filtered", sep = ""), pattern = "_R2_001_trim.fastq", full.names = TRUE))
+
+# get sample names to check forward and reverse names match
+sample.names <- unname(sapply(filtFs, get.sample.name))
+
+# use sample names as names
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# The DADA2 algorithm makes use of a parametric error model (err)
+# and every amplicon dataset has a different set of error rates.
+
+errF <- learnErrors(filtFs, multithread = T)
+errR <- learnErrors(filtRs, multithread = T)
+
+# save objects for errors in case we want to redo things
+saveRDS(errF, file = paste("dada2/", folder_name, "_errF.rds", sep = ""))
+saveRDS(errR, file = paste("dada2/", folder_name, "_errR.rds", sep = ""))
+
+# make error plots to check all looks ok
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+
+# save errors plot
+ggsave(paste("figures/error-plots/", folder_name, "_errors_plot.pdf", sep = ""), errorPlot, width = 12, height = 11, dpi = 300)
+
+
+#-------------- Dereplication Step
+#
+# This step will crash if there were samples for which ZERO reads passed the filterAndTrim() function
+# Best way to prevent this issue is to load directly the files in the filtered folder
+# And also we need to create a new set of sample names just in case they are different
+# can be too time consuming on laptop, but runs ok on hydra
+
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# save objects for dereps
+
+save(derepFs, file = paste("dada2/", folder_name, "_derepFs.R", sep = ""))
+save(derepRs, file = paste("dada2/", folder_name, "_derepRs.R", sep = ""))
+
+#-------------- Sample inference
+
+dadaRs <- dada(derepRs, err= errR, multithread = T)
+dadaFs <- dada(derepFs, err= errF, multithread = T)
+
+save(dadaFs, file = paste("dada2/", folder_name, "_dadaFs.R", sep = ""))
+save(dadaRs, file = paste("dada2/", folder_name, "_dadaRs.R", sep = ""))
+
+#-------------- Merge paired reads, remove chimeras, and get ASV table
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+
+save(mergers, file = paste("dada2/", folder_name, "_mergers.R", sep = ""))
+
+names(mergers) <- sample.names
+
+# Construct sequence table 
+
+seqtab <- makeSequenceTable(mergers)
+
+# Save ASV table
+
+saveRDS(seqtab, paste("dada2/", folder_name, "_seqtab.rds", sep = "")) # save as serialized r object
+
+#--------------Tracking number of reads in each step
+
+# Compile the number of reads from the different steps of the pipeline
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN))
+
+# add colnames and rownames to the tracking data
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+head(track)
+
+# save tracking table as .csv
+
+write.csv(track, paste("dada2/", folder_name, "_seqs_tracked.csv", sep = ""))
+
+#---------------Inspect distribution of sequence length
+
+reads.per.seqlen <- tapply(colSums(seqtab), factor(nchar(getSequences(seqtab))), sum)
+df <- data.frame(length=as.numeric(names(reads.per.seqlen)), count=reads.per.seqlen)
+seqlen_plot <- ggplot(data=df, aes(x=length, y=count)) +
+  geom_col() +
+  theme_bw()
+ggsave(paste("figures/length-distribution/", folder_name, "_seqlen_plot.pdf", sep = ""), seqlen_plot, width = 12, height = 11, dpi = 300)
+
+# Inspect distribution of sequence lengths
+seqlen_table <- as.data.frame(table(nchar(getSequences(seqtab))))
+names(seqlen_table) <- c("seq_length")
+write.csv(seqlen_table, paste("dada2/", folder_name, "_seqlen_table.csv", sep = ""),row.names = F) 
+```

@@ -1,0 +1,1167 @@
+---
+title: "Data analysis"
+author: "Paula Pappalardo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex 
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r markdown setup}
+library(knitr)
+
+# tidy options
+
+knitr::opts_chunk$set(echo = T, eval= F, warning = F, message = F, comment = "",
+                      tidy.opts = list(width.cutoff = 55), tidy = TRUE)
+```
+
+# Overview
+
+Here we will estimate species richness and run community composition analysis using phyloseq.
+
+```{r setup}
+library(phyloseq)
+library(phyloseqCompanion)
+library(microbiome)
+library(speedyseq)
+library(vegan)
+library(gridExtra)
+library(ggpubr)
+library(tidyverse)
+library(viridis)
+library(scales)
+library(ARTool)
+library(FSA)
+library(grid)
+
+
+# source functions we need
+source("007a_Summarizing-data_functions.R") 
+source("008a_Phyloseq-data-analysis_functions.R")
+
+# set seed for random number generator
+set.seed(12345)
+```
+
+
+# Load and subset data for analysis
+
+
+```{r load data we need}
+# phyloseq datasets
+load("results/pws_alltarget.R")
+load("results/pws_goodmeta.R")
+load("results/pws_temporal.R")
+load("results/pws_tide.R")
+load("results/pws_day_night.R")
+load("results/pws_con.R")
+load("results/pws_vdz.R")
+load("results/pws_vmt.R")
+load("results/pws_allthree.R")
+
+# make dataframe with good metazoans
+df_goodmeta <- speedyseq::psmelt(pws_goodmeta) 
+
+# all target data df
+df_alltarget <- speedyseq::psmelt(pws_alltarget)
+
+# load species traits
+status_by_species <- read_csv("metadata/status_by_species.csv")
+
+```
+
+```{r separate harpacticoids for reviewer question}
+# harp <- df_goodmeta %>% 
+#   filter(Abundance != 0 & order == "Harpacticoida") %>% 
+#   distinct(order, family, genus, species)
+```
+
+```{r count reads per taxa name for reviewer question}
+# reads_per_taxa <- df_goodmeta %>% 
+#   filter(Abundance != 0) %>% 
+#   group_by(sciname) %>% 
+#   summarise(n_reads = sum(Abundance),
+#             uniq_ASV = length(unique(OTU))) %>% 
+#   arrange(n_reads)
+```
+
+
+# Factors comparison
+
+Given that the differences between months are so important, we want to test each factor accounting for month, and same with relative abundance plots. For relative abundance plots, we want to make sure we are merging the samples by the factors we want to plot so that relatively abundance always sum to 1. The merge_samples from phyloseq is ok, but makes everything else you are not merging NA, so the other factors are not available for plotting. The merge_samples2 from speedyseq seems to overcome that and you can specify custom functions to merge your data...but refuses to work properly on a combined Month_Tide factor for example. So it needs some tweaks.
+
+```{r tide comparisons - things we need}
+# define custom functions to merge sample data when needed
+custom_funs_tide <- list(
+  month = function(x) unique(x)[1],  # First non-NA value for month
+  year = function(x) as.character(unique(x)[1]),
+  tide = function(x) unique(x)[1],
+  ave_salinity = function(x) mean(x, na.rm = TRUE),
+  ave_temperature = function(x) mean(x, na.rm = TRUE)
+)
+
+# add a combined month/tide column to merge samples
+sample_data(pws_tide)$MonthTide <- with(sample_data(pws_tide), paste(tide,as.character(month), sep="_"))
+
+# Merge samples using the custom functions
+merged_tide <- speedyseq::merge_samples2(pws_tide, "MonthTide", funs = custom_funs_tide)
+
+#----Aggregate by sciname
+# remove taxa without phylum information
+tide_sciname <- pws_tide %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>%
+  fixFactorsOrder()
+
+# check all looks good
+View(tax_table(tide_sciname))
+
+```
+
+
+```{r day vs night comparisons - things we need}
+# define custom functions to merge sample data when needed
+custom_funs <- list(
+  month = function(x) unique(x)[1],  # First non-NA value for month
+  year = function(x) as.character(unique(x)[1]),
+  DayNight = function(x) unique(x)[1],
+  ave_salinity = function(x) mean(x, na.rm = TRUE),
+  ave_temperature = function(x) mean(x, na.rm = TRUE)
+)
+
+# add a combined month/tide column to merge samples
+sample_data(pws_day_night)$MonthDayNight <- with(sample_data(pws_day_night), paste(DayNight, as.character(month), sep="_"))
+
+# Merge samples using the custom functions
+merged_day_night <- speedyseq::merge_samples2(pws_day_night, "MonthDayNight", funs = custom_funs)
+# check all looks good
+View(sample_data(merged_day_night))
+
+#----Aggregate by sciname
+# remove taxa without phylum information
+day_night_sciname <- pws_day_night %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>%
+  fixFactorsOrder()
+
+# check all looks good
+View(tax_table(day_night_sciname))
+
+```
+
+
+```{r location comparisons - things we need}
+# define custom functions to merge sample data when needed
+custom_funs_location <- list(
+  month = function(x) unique(x)[1],  # First non-NA value for month
+  year = function(x) as.character(unique(x)[1]),
+  location = function(x) unique(x)[1],
+  ave_salinity = function(x) mean(x, na.rm = TRUE),
+  ave_temperature = function(x) mean(x, na.rm = TRUE)
+)
+
+# add a combined month/tide column to merge samples
+sample_data(pws_allthree)$MonthLocation <- with(sample_data(pws_allthree), paste(location, as.character(month), sep="_"))
+
+# Merge samples using the custom functions
+merged_location <- speedyseq::merge_samples2(pws_allthree, "MonthLocation", funs = custom_funs_location)
+
+#----Aggregate by sciname
+# remove taxa without phylum information
+location_sciname <- pws_allthree %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>%
+  fixFactorsOrder()
+
+# check all looks good
+View(tax_table(location_sciname))
+
+
+```
+
+```{r temporal comparisons - things we need}
+
+# Merge samples using the custom functions
+merged_temporal <- phyloseq::merge_samples(pws_temporal, "year")
+
+#----Aggregate by sciname
+# remove taxa without phylum information
+temporal_sciname <- pws_temporal %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>%
+  fixFactorsOrder()
+
+# check all looks good
+View(tax_table(temporal_sciname))
+View(sample_data(merged_temporal))
+
+```
+
+```{r month comparisons - things we need}
+# Merge samples using the custom functions
+merged_con <- phyloseq::merge_samples(pws_con, "month")
+sample_data(merged_con)$month <- rownames(sample_data(merged_con))
+merged_vdz <- phyloseq::merge_samples(pws_vdz, "month")
+sample_data(merged_vdz)$month <- rownames(sample_data(merged_vdz))
+merged_vmt <- phyloseq::merge_samples(pws_vmt, "month")
+sample_data(merged_vmt)$month <- rownames(sample_data(merged_vmt))
+
+
+#----Aggregate by sciname
+con_sciname <- pws_con %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>%
+  fixFactorsOrder()
+vdz_sciname <- pws_vdz %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>%
+  fixFactorsOrder()
+vmt_sciname <- pws_vmt %>% 
+  phyloseq::prune_samples(sample_sums(.) > 0, .) %>% 
+  phyloseq::prune_taxa(taxa_sums(.) > 0, .) %>% 
+  microbiome::aggregate_taxa(level = "sciname") %>%
+  fixFactorsOrder()
+
+# check all looks good
+#iew(tax_table(con_sciname))
+
+
+```
+
+To create a significance table for each factor and their interaction using adonis2 from the vegan package, you can use the by argument to specify how the terms should be assessed. Setting by = "terms" will provide the sequential significance of each term, while by = "margin" will give you the marginal effects of each term. Below are the _permanova_ results for each factor:
+
+```{r tide permanova}
+# create your dist matrix
+jaccard_dist <- phyloseq::distance(tide_sciname, method = "jaccard")
+
+# run permanova
+permanova_tide <- vegan::adonis2(jaccard_dist ~ tide * month, data = data.frame(sample_data(tide_sciname)), by = "terms")
+permanova_tide
+
+
+```
+
+```{r day night permanova}
+# create your dist matrix
+jaccard_dist <- phyloseq::distance(day_night_sciname, method = "jaccard")
+
+# run permanova
+permanova_day_night <- vegan::adonis2(jaccard_dist ~ DayNight * month, data = data.frame(sample_data(day_night_sciname)), by = "terms")
+permanova_day_night
+
+
+```
+
+```{r location permanova}
+# create your dist matrix
+jaccard_dist <- phyloseq::distance(location_sciname, method = "jaccard")
+
+# run permanova
+permanova_location <- vegan::adonis2(jaccard_dist ~ location * month, data = data.frame(sample_data(location_sciname)), by = "terms")
+permanova_location
+
+
+```
+
+```{r month permanova by location}
+# CON----
+# calculate distance
+jaccard_vmt <- phyloseq::distance(con_sciname, method = "jaccard")
+# run permanova
+permanova_vmt <- vegan::adonis2(jaccard_vmt ~ month, data = data.frame(sample_data(con_sciname)), by = "terms")
+permanova_vmt
+
+# VDZ----
+# calculate distance
+jaccard_vdz <- phyloseq::distance(vdz_sciname, method = "jaccard")
+# run permanova
+permanova_vdz <- vegan::adonis2(jaccard_vdz ~ month, data = data.frame(sample_data(vdz_sciname)), by = "terms")
+permanova_vdz
+
+# VMT----
+# calculate distance
+jaccard_vmt <- phyloseq::distance(vmt_sciname, method = "jaccard")
+# run permanova
+permanova_vmt <- vegan::adonis2(jaccard_vmt ~ month, data = data.frame(sample_data(vmt_sciname)), by = "terms")
+permanova_vmt
+```
+
+```{r temporal permanova}
+# create your dist matrix
+jaccard_dist <- phyloseq::distance(temporal_sciname, method = "jaccard")
+
+# run permanova
+permanova_temporal <- vegan::adonis2(jaccard_dist ~ year, data = data.frame(sample_data(temporal_sciname)), by = "terms")
+permanova_temporal
+
+
+```
+
+```{r week permanova by location}
+# CON----
+# calculate distance
+jaccard_con_week <- phyloseq::distance(con_sciname, method = "jaccard")
+# run permanova
+permanova_con_week <- vegan::adonis2(jaccard_con_week ~ month / as.factor(week_paula), data = data.frame(sample_data(con_sciname)), by = "terms")
+permanova_con_week
+
+# VDZ----
+# calculate distance
+jaccard_vdz_week <- phyloseq::distance(vdz_sciname, method = "jaccard")
+# run permanova
+permanova_vdz_week <- vegan::adonis2(jaccard_vdz_week ~ month / as.factor(week_paula), data = data.frame(sample_data(vdz_sciname)), by = "terms")
+permanova_vdz_week
+
+
+```
+
+To determine if there are significant differences in _species richness estimates_, such as the Chao1 index, you can follow these steps using the phyloseq package along with statistical tests like ANOVA or Kruskal-Wallis, depending on the data distribution.
+
+```{r tide richness}
+# get Chao1 estimates
+richness_estimates <- estimate_richness(tide_sciname, measures = "Chao1")
+# extract sample data and combine with richness
+sample_data_df <- as(sample_data(tide_sciname), "data.frame")
+richness_data <- cbind(sample_data_df, richness_estimates)
+
+# check it the data show normal distribution
+hist(richness_data$Chao1) 
+shapiro.test(richness_data$Chao1)
+ 
+# Code for kruskal if testing only ONE factor
+# kruskal_result <- kruskal.test(Chao1 ~ tide, data = richness_data) 
+# print(kruskal_result)
+
+# Run two way kruskal test because data are not normal
+art_model <- art(Chao1 ~ factor(tide) * factor(month), data = richness_data)
+anova(art_model)
+```
+
+
+```{r day night richness}
+# get Chao1 estimates
+richness_estimates <- estimate_richness(day_night_sciname, measures = "Chao1")
+# extract sample data and combine with richness
+sample_data_df <- as(sample_data(day_night_sciname), "data.frame")
+richness_data <- cbind(sample_data_df, richness_estimates)
+
+# check it the data show normal distribution
+hist(richness_data$Chao1) 
+shapiro.test(richness_data$Chao1)
+ 
+# Code for kruskal if testing only ONE factor
+# kruskal_result <- kruskal.test(Chao1 ~ tide, data = richness_data) 
+# print(kruskal_result)
+
+# Run two way kruskal test because data are not normal
+art_model <- art(Chao1 ~ factor(DayNight) * factor(month), data = richness_data)
+anova(art_model)
+```
+
+
+```{r location richness}
+# get Chao1 estimates
+richness_estimates <- estimate_richness(location_sciname, measures = "Chao1")
+# extract sample data and combine with richness
+sample_data_df <- as(sample_data(location_sciname), "data.frame")
+richness_data <- cbind(sample_data_df, richness_estimates)
+
+# check it the data show normal distribution
+hist(richness_data$Chao1) 
+shapiro.test(richness_data$Chao1)
+ 
+# Code for kruskal if testing only ONE factor
+# kruskal_result <- kruskal.test(Chao1 ~ tide, data = richness_data) 
+# print(kruskal_result)
+
+# Run two way kruskal test because data are not normal
+art_model_location <- art(Chao1 ~ factor(location) * factor(month), data = richness_data)
+anova(art_model_location)
+```
+
+
+```{r month by location richness}
+# get Chao1 estimates
+con_estimates <- estimate_richness(con_sciname, measures = "Chao1")
+vdz_estimates <- estimate_richness(vdz_sciname, measures = "Chao1")
+vmt_estimates <- estimate_richness(vmt_sciname, measures = "Chao1")
+
+# extract sample data and combine with richness
+richness_vmt <- cbind(as.data.frame(sample_data(con_sciname)), con_estimates)
+richness_vdz <- cbind(as.data.frame(sample_data(vdz_sciname)), vdz_estimates)
+richness_vmt<- cbind(as.data.frame(sample_data(vmt_sciname)), vmt_estimates)
+
+# check it the data show normal distribution
+hist(richness_vmt$Chao1)
+shapiro.test(richness_vmt$Chao1)
+ 
+# Code for kruskal if testing only ONE factor
+# CON
+kruskal_vmt <- kruskal.test(Chao1 ~ month, data = richness_vmt) 
+kruskal_vmt
+
+dunn_test_vmt <- dunnTest(Chao1 ~ month, data = richness_vmt, method = "bonferroni")
+dunn_test_vmt
+
+median_richness <- aggregate(Chao1 ~ month, data = richness_vmt, median)
+
+
+```
+
+
+```{r temporal richness}
+# get Chao1 estimates
+richness_estimates <- estimate_richness(temporal_sciname, measures = "Chao1")
+# extract sample data and combine with richness
+sample_data_df <- as(sample_data(temporal_sciname), "data.frame")
+richness_data <- cbind(sample_data_df, richness_estimates)
+
+# check it the data show normal distribution
+hist(richness_data$Chao1) 
+shapiro.test(richness_data$Chao1)
+ 
+# Code for kruskal if testing only ONE factor
+kruskal_temporal <- kruskal.test(Chao1 ~ year, data = richness_data) 
+kruskal_temporal
+
+dunn_test_temporal <- dunnTest(Chao1 ~ year, data = richness_data, method = "bonferroni")
+dunn_test_temporal
+
+```
+
+Here we can prepare the figures for the manuscript with richness and taxonomic composition by factor and plankton group. 
+
+```{r figure 2 - seasonality month}
+# CON-----
+
+# Calculate alpha diversity and combine with sample data 
+alpha_div_con <- con_sciname %>%
+  estimate_richness(measures = c("Observed", "Shannon")) %>%
+  bind_cols(data.frame(sample_data(con_sciname))[, c("location", "month")]) %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon"),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+# Create the richness plot
+con_richness_plot <- ggplot(alpha_div_con, aes(x = month, y = value)) +
+  geom_boxplot() +
+  ylab("Taxa richness") +
+  xlab("Month") +
+  facet_wrap(~location + measure, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+# taxa plot
+con_df <- merged_con %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x)) %>% 
+  addPlanktonGroupToTaxTable(.) %>% 
+  fixFactorsOrder() %>%
+  speedyseq::psmelt(.) %>% 
+  addCustomTaxa() %>% 
+  mutate(location = "CON")
+
+con_taxa_plot <- con_df %>%
+  filter(plankton_group %in% c("Holoplankton", "Meroplankton")) %>% 
+  ggplot(., aes(x = month, y = Abundance, fill = custom_taxa)) +
+  xlab("Month") +
+  facet_wrap(location ~ plankton_group, scales = "free_y") +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "right") +
+  scale_fill_manual(values = custom_taxa_all, name = "") 
+
+# con_copepods <- con_df %>%
+#   filter(class == "Copepoda" & Abundance != 0) %>% 
+#   ggplot(., aes(x = month, y = Abundance, fill = genus)) +
+#   xlab("Month") +
+#   ylab("Relative abundance") +
+#   facet_wrap(location ~ plankton_group, scales = "free_y") +
+#   geom_col(position = "stack") +
+#   niceplot +
+#   theme(legend.position = "right") +
+#   scale_fill_manual(values = custom_taxa_all, name = "") 
+
+# VDZ-----
+
+# Calculate alpha diversity and combine with sample data 
+alpha_div_vdz <- vdz_sciname %>%
+  estimate_richness(measures = c("Observed", "Shannon")) %>%
+  bind_cols(data.frame(sample_data(vdz_sciname))[, c("location", "month")]) %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon"),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+# Create the richness plot
+vdz_richness_plot <- ggplot(alpha_div_vdz, aes(x = month, y = value)) +
+  geom_boxplot() +
+  ylab("Taxa richness") +
+  xlab("Month") +
+  facet_wrap(~location + measure, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+# taxa plot
+vdz_df <- merged_vdz %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x)) %>% 
+  addPlanktonGroupToTaxTable(.) %>% 
+  fixFactorsOrder() %>%
+  speedyseq::psmelt(.) %>% 
+  addCustomTaxa() %>% 
+  mutate(location = "VDZ")
+
+# taxa plot variation with custom taxa labels
+vdz_taxa_plot <- vdz_df %>%
+  filter(plankton_group %in% c("Holoplankton", "Meroplankton")) %>% 
+  ggplot(., aes(x = month, y = Abundance, fill = custom_taxa)) +
+  xlab("Month") +
+  ylab("Relative abundance") +
+  facet_wrap(location ~ plankton_group, scales = "free_y") +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "right") +
+  scale_fill_manual(values = custom_taxa_all, name = "") 
+
+
+# VMT-----
+# Calculate alpha diversity and combine with sample data 
+alpha_div_vmt <- vmt_sciname %>%
+  estimate_richness(measures = c("Observed", "Shannon")) %>%
+  bind_cols(data.frame(sample_data(vmt_sciname))[, c("location", "month")]) %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon"),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+# Create the richness plot
+vmt_richness_plot <- ggplot(alpha_div_vmt, aes(x = month, y = value)) +
+  geom_boxplot() +
+  ylab("Taxa richness") +
+  xlab("Month") +
+  facet_wrap(~location + measure, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+# taxa plot
+vmt_df <- merged_vmt %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x)) %>% 
+  addPlanktonGroupToTaxTable(.) %>% 
+  fixFactorsOrder() %>%
+  speedyseq::psmelt(.) %>% 
+  addCustomTaxa() %>% 
+  mutate(location = "VMT")
+
+vmt_taxa_plot <- vmt_df %>%
+  filter(plankton_group %in% c("Holoplankton", "Meroplankton")) %>% 
+  ggplot(., aes(x = month, y = Abundance, fill = custom_taxa)) +
+  xlab("Month") +
+  ylab("Relative abundance") +
+  facet_wrap(location ~ plankton_group, scales = "free_y") +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "right") +
+  scale_fill_manual(values = custom_taxa_all, name = "", guide = guide_legend(nrow = 5)) 
+
+
+seasonality_fig <- egg::ggarrange(con_richness_plot + theme(legend.position = "none",
+                                                            axis.title.x = element_blank(),
+                                                            axis.title.y = element_blank()),
+                                  con_taxa_plot + theme(legend.position = "none",
+                                                        axis.title.x = element_blank(),
+                                                        axis.title.y = element_blank()),
+                                  vdz_richness_plot + theme(legend.position = "none",
+                                                            axis.title.x = element_blank()),
+                                  vdz_taxa_plot + theme(legend.position = "right",
+                                                        axis.title.x = element_blank()),
+                                  vmt_richness_plot + theme(legend.position = "bottom",
+                                                            axis.title.y = element_blank()),
+                                  vmt_taxa_plot + theme(legend.position = "none",
+                                                        axis.title.y = element_blank()),
+                                  nrow = 3,
+                                  ncol = 2,
+                                  labels = paste("(", letters[1:6], ")", sep = ""),
+                                  widths = c(2/4, 2/4) ) 
+
+# save figure as pdf
+fig2_name <- paste("figures/Fig2_location-by-month_", Sys.Date(),".pdf", sep = "")
+ggsave(fig2_name, seasonality_fig , height = 11, width = 15, dpi = 300)
+#ggsave("../Pappalardo_etal_ZoopPWS/revision-2025-08/submitted_2025-09-19/Figure_2.tif", seasonality_fig , height = 11, width = 15, dpi = 300)
+
+#----reformat for ICES 
+finishing <- theme(legend.key.size = unit(0.4, 'cm'),
+                   strip.text = element_text(size = 7),
+                   legend.text = element_text(size = 7),
+                   axis.text.x = element_text(size = 9),
+                   axis.text.y = element_text(size = 9),
+                   axis.title.x = element_text(size = 10),
+                   axis.title.y = element_text(size = 10))
+
+
+
+seasonality_fig <- egg::ggarrange(con_richness_plot +
+                                    finishing +
+                                    theme(legend.position = "none",
+                                                            axis.title.x = element_blank(),
+                                                            axis.title.y = element_blank()),
+                                  
+                                  con_taxa_plot +
+                                    finishing +
+                                    theme(legend.position = "none",
+                                                        axis.title.x = element_blank(),
+                                                        axis.title.y = element_blank()),
+                                  
+                                  vdz_richness_plot +
+                                    finishing +
+                                    theme(legend.position = "none",
+                                                            axis.title.x = element_blank()),
+                                          
+                                  vdz_taxa_plot +
+                                    finishing +
+                                    theme(legend.position = "none",
+                                                        axis.title.x = element_blank()),
+                                  
+                                  vmt_richness_plot +
+                                    finishing +
+                                    theme(legend.position = "none",
+                                          axis.title.y = element_blank()),
+                                  
+                                  vmt_taxa_plot +
+                                    finishing +
+                                    theme(legend.position = "bottom",
+                                          legend.justification = c(1.2,0),
+                                          axis.title.y = element_blank()),
+                                  nrow = 3,
+                                  ncol = 2,
+                                  labels = paste("(", letters[1:6], ")", sep = ""),
+                                  label.args = list(gp = grid::gpar(fontsize = 10, fontface = "bold")),  
+                                  widths = c(2/4, 2/4)) 
+
+# Calculate the proportional height for a single-column figure
+fig2_width_mm <- 170
+fig2_height_mm <- (170 * 16) / 15
+# Save the figure with the new dimensions
+ggsave("figures/Figure_2_ICES.tif", seasonality_fig, 
+       width = fig2_width_mm, 
+       height = fig2_height_mm, 
+       units = "mm", 
+       dpi = 300,
+       compression = "lzw")
+```
+
+
+```{r copepods figure S1 }
+library(microshades)
+fixSampleOrder <- function(mydf){
+  mydf_ed <- mydf %>% 
+    mutate(Sample = factor(Sample,
+                        levels = c("April", "May", "June", "July", "August", "September"),
+                        labels = c("Apr", "May", "Jun", "Jul", "Aug", "Sep")))
+  return(mydf_ed)
+}
+
+con_copepods <- con_df %>%
+  filter(class == "Copepoda" & Abundance != 0 & !is.na(order)) %>%
+  fixSampleOrder()
+
+vdz_copepods <- vdz_df %>%
+  filter(class == "Copepoda" & Abundance != 0 & !is.na(order)) %>%
+  fixSampleOrder()
+
+vmt_copepods <- vmt_df %>%
+  filter(class == "Copepoda" & Abundance != 0 & !is.na(order)) %>%
+  fixSampleOrder()
+    
+# CON copepods
+color_objs_con <- create_color_dfs(con_copepods, selected_groups = c("Cyclopoida", "Calanoida", "Harpacticoida"),
+                   cvd = TRUE,
+                   group_level = "order",
+                   subgroup_level = "family",
+                   top_n_subgroups = 2, top_orientation = FALSE)
+
+mdf_con <- color_objs_con$mdf
+cdf_con <- color_objs_con$cdf
+
+p_con <- plot_microshades(mdf_con, cdf_con, group_label = "Order-Family") +
+  niceplot +
+  ggtitle("(a) CON") +
+  labs(x = "Month", y = "Relative abundance")
+
+# VDZ copepods
+color_objs_vdz <- create_color_dfs(vdz_copepods, selected_groups = c("Cyclopoida", "Calanoida", "Harpacticoida"),
+                   cvd = TRUE,
+                   group_level = "order",
+                   subgroup_level = "family",
+                   top_n_subgroups = 2, top_orientation = FALSE)
+
+mdf_vdz <- color_objs_vdz$mdf
+cdf_vdz <- color_objs_vdz$cdf
+
+p_vdz <- plot_microshades(mdf_vdz, cdf_vdz, group_label = "Order-Family") +
+  niceplot +
+  ggtitle("(b) VDZ") +
+  labs(x = "Month", y = "Relative abundance")
+
+# VMT copepods
+color_objs_vmt <- create_color_dfs(vmt_copepods, selected_groups = c("Cyclopoida", "Calanoida", "Harpacticoida"),
+                   cvd = TRUE,
+                   group_level = "order",
+                   subgroup_level = "family",
+                   top_n_subgroups = 2, top_orientation = FALSE)
+
+mdf_vmt <- color_objs_vmt$mdf
+cdf_vmt <- color_objs_vmt$cdf
+
+p_vmt <- plot_microshades(mdf_vmt, cdf_vmt, group_label = "Order-Family") +
+  niceplot +
+  ggtitle("(c) VMT") +
+  labs(x = "Month", y = "Relative abundance")
+
+copepods_fig <- egg::ggarrange(p_con + theme(legend.position = "right", legend.text = element_text(size = 9) ),
+                               p_vdz + theme(legend.position = "right", legend.text = element_text(size = 9)),
+                               p_vmt + theme(legend.position = "right", legend.text = element_text(size = 9)),
+                                  nrow = 3,
+                                  ncol = 1)
+                                  #widths = c(1/4, 3/4) ) 
+
+# save figure as pdf
+figS1_name <- paste("figures/FigS1_copepods_", Sys.Date(),".pdf", sep = "")
+ggsave(figS1_name, copepods_fig , height = 11, width = 12, dpi = 300)
+
+
+```
+
+
+```{r figure 3 - seasonality week}
+# Merge samples using the custom functions
+con_week <- phyloseq::merge_samples(pws_con, "week_paula")
+vdz_week <- phyloseq::merge_samples(pws_vdz, "week_paula")
+# add a combined month/tide column to merge samples
+sample_data(pws_con)$MonthWeek <- with(sample_data(pws_con), paste(month, as.character(Week), sep="_"))
+con_week <- phyloseq::merge_samples(pws_con, "MonthWeek")
+View(sample_data(con_week))
+sample_data(con_week)$MonthWeek <- rownames(sample_data(con_week))
+
+sample_data(pws_vdz)$MonthWeek <- with(sample_data(pws_vdz), paste(month, as.character(Week), sep="_"))
+vdz_week <- phyloseq::merge_samples(pws_vdz, "MonthWeek")
+View(sample_data(vdz_week))
+sample_data(vdz_week)$MonthWeek <- rownames(sample_data(vdz_week))
+
+month_week_levels = c("April_Week1", "April_Week2","April_Week3", "April_Week4",
+                                               "May_Week5","May_Week6","May_Week7","May_Week8",
+                                               "June_Week9","June_Week10","June_Week11","June_Week12",
+                                               "July_Week13","July_Week14","July_Week15","July_Week16", "July_Week17",
+                                                "August_Week18","August_Week19","August_Week20","August_Week21",
+                                               "September_Week21")
+month_week_labels = c("Apr_W1", "Apr_W2","Apr_W3", "Apr_W4",
+                                               "May_W5","May_W6","May_W7","May_W8",
+                                               "Jun_W9","Jun_W10","Jun_W11","Jun_W12",
+                                               "Jul_W13","Jul_W14","Jul_W15","Jul_W16", "Jul_W17",
+                                                "Aug_W18","Aug_W19","Aug_W20","Aug_W21",
+                                               "Sep_W21")
+  
+con_week_richness_plot <- plot_richness(con_sciname, x = "week_paula",  measures = "Chao1") + 
+  #ggtitle("Unique taxa richness") +
+  ylab("Taxa richness") +
+  xlab("Month") +
+  geom_boxplot() +
+  facet_wrap(~location) +
+  niceplot +
+  theme(legend.position = "right") 
+# make df for taxa plot
+con_week_df <- con_week %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x)) %>% 
+  fixFactorsOrder() %>%
+  speedyseq::psmelt(.) %>% 
+  addPlanktonGroup() %>% 
+  mutate(f_week = factor(MonthWeek, levels = month_week_levels, labels = month_week_labels , ordered = T)) %>% 
+  addCustomTaxa() 
+
+vdz_week_df <- vdz_week %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x)) %>% 
+  fixFactorsOrder() %>%
+  speedyseq::psmelt(.) %>% 
+  addPlanktonGroup() %>% 
+  mutate(f_week = factor(MonthWeek, levels = month_week_levels, labels = month_week_labels, ordered = T)) %>% 
+  addCustomTaxa() 
+
+# class taxa plot
+conweek_customtaxa_plot <- con_week_df %>%
+  filter(plankton_group %in% c("Holoplankton", "Meroplankton")) %>% 
+  ggplot(., aes(x = f_week, y = Abundance, fill = custom_taxa)) +
+  xlab("Week") +
+  facet_wrap(~ plankton_group, scales = "free_y") +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "right")  +
+  scale_fill_manual(values = custom_taxa_all, name = "") +
+  scale_x_discrete(limits = levels(con_week_df$f_week))
+
+vdzweek_customtaxa_plot <- vdz_week_df %>%
+  filter(plankton_group %in% c("Holoplankton", "Meroplankton")) %>% 
+  ggplot(., aes(x = f_week, y = Abundance, fill = custom_taxa)) +
+  xlab("Week") +
+  facet_wrap(~ plankton_group, scales = "free_y") +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "right")  +
+  scale_fill_manual(values = custom_taxa_all, name = "", guide = guide_legend(nrow = 5)) +
+  scale_x_discrete(limits = levels(vdz_week_df$f_week))
+
+
+# Figure 3----
+week_figure <- egg::ggarrange(conweek_customtaxa_plot + theme(legend.position = "none",
+                                                              axis.title.x = element_blank(),
+                                                              axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust = 1)) ,
+                                  vdzweek_customtaxa_plot + theme(legend.position = "bottom", axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust = 1),),
+          nrow = 2,
+          ncol = 1,
+          labels = c("(a) CON", "(b) VDZ"))
+
+# save figure as pdf
+fig3_name <- paste("figures/Fig3_seasonality-week_", Sys.Date(),".pdf", sep = "")
+ggsave(fig3_name, week_figure , height = 12, width = 13, dpi = 300)
+#ggsave("figures/Figure_3.tif", week_figure , height = 12, width = 13, dpi = 300)
+
+#----reformat for ICES 
+finishing <- theme(legend.key.size = unit(0.4, 'cm'),
+                   strip.text = element_text(size = 9),
+                   legend.text = element_text(size = 8),
+                   axis.text.x = element_text(size = 9),
+                   axis.text.y = element_text(size = 9),
+                   axis.title.x = element_text(size = 10),
+                   axis.title.y = element_text(size = 10))
+
+week_figure_ices <- egg::ggarrange(conweek_customtaxa_plot +
+                                     finishing +
+                                     theme(legend.position = "none",
+                                                              axis.title.x = element_blank(),
+                                                              axis.text.x = element_text(size = 9, angle = 90, vjust = 0.5, hjust = 1)) ,
+                                  vdzweek_customtaxa_plot +
+                                    finishing +
+                                    theme(legend.position = "bottom",
+                                          legend.justification = c(1, 0),
+                                          axis.text.x = element_text(size = 9, angle = 90, vjust = 0.5, hjust = 1),),
+          nrow = 2,
+          ncol = 1,
+          label.args = list(gp = grid::gpar(fontsize = 10, fontface = "bold")),
+          labels = c("(a) CON", "(b) VDZ"))
+
+# Calculate the proportional height for a single-column figure
+fig3_width_mm <- 170
+fig3_height_mm <- (170 * 12) / 13
+# Save the figure with the new dimensions
+ggsave("figures/Figure_3_ICES.tif", week_figure_ices, 
+       width = fig3_width_mm, 
+       height = fig3_height_mm, 
+       units = "mm", 
+       dpi = 300,
+       compression = "lzw")
+```
+
+
+```{r figure S5 - factor comparison tide and daynight}
+# Tide-------------
+relab_tide <- merged_tide %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x))
+#relab_tide_ppm <- transform_sample_counts(merged_tide, function(x) 1E6 * x/sum(x)) # this option would standardize as part per million, can be useful if you have very small numbers, but have to remember for data interpretation
+
+relab_dvn <- merged_day_night %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x))
+
+relab_location <- merged_location %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x))
+
+
+# Species richness----
+# Calculate alpha diversity and combine with sample data 
+alpha_div_tide <-tide_sciname %>%
+  estimate_richness(measures = c("Observed", "Shannon")) %>%
+  bind_cols(data.frame(sample_data(tide_sciname))[, c("location", "month", "tide")]) %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon"),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+# Create the richness plot
+tide_richness_plot <- ggplot(alpha_div_tide, aes(x = tide, y = value)) +
+  geom_boxplot() +
+  ylab("Taxa richness") +
+  xlab("Tide") +
+  #facet_wrap(~location + measure, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+# Calculate alpha diversity and combine with sample data 
+alpha_div_dvn <- day_night_sciname %>%
+  estimate_richness(measures = c("Observed", "Shannon")) %>%
+  bind_cols(data.frame(sample_data(day_night_sciname))[, c("location","month", "DayNight")]) %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon"),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+# Create the richness plot
+dvn_richness_plot <- ggplot(alpha_div_dvn, aes(x = DayNight, y = value)) +
+  geom_boxplot() +
+  ylab("Taxa richness") +
+  xlab("Day vs Night") +
+  #facet_wrap(~location + measure, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+
+# Relative abundance plots----
+
+# Tide
+tide_taxa_plot <- relab_tide %>% 
+  #addPlanktonGroupToTaxTable(.) %>% 
+  fixFactorsOrder() %>%
+  speedyseq::psmelt(.)  %>%
+  addCustomTaxa() %>% 
+  ggplot(., aes(x = tide, y = Abundance, fill = custom_taxa)) +
+  xlab("Tide") +
+  ylab("Relative abundance") + 
+  #facet_wrap(~month) +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "none",
+        axis.title.x = element_text(margin = margin(t = 5)),
+        axis.title.y = element_text(margin = margin(t = 5))) +
+  scale_fill_manual(values = custom_taxa_all, name = "") 
+
+
+# Day vs night
+dvn_taxa_plot <- relab_dvn %>% 
+  fixFactorsOrder() %>% 
+  speedyseq::psmelt(.) %>% 
+  addCustomTaxa() %>% 
+  ggplot(., aes(x = DayNight, y = Abundance, fill = custom_taxa)) +
+  #facet_wrap(~month) +
+  xlab("Day vs Night") +
+  ylab("Relative abundance") +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "right") +
+  #guides(color = "none") +
+  scale_fill_manual(values = custom_taxa_all, name = "") 
+
+
+
+# Figure 4----
+tide_dvn_figure <- egg::ggarrange(tide_richness_plot +
+                                     theme(axis.text.y = element_text(size = 8, vjust = 0.3)), 
+          tide_taxa_plot + theme(legend.position = "right",
+                                 legend.justification = c(0, 1)),
+          dvn_richness_plot,
+          dvn_taxa_plot + theme(legend.position = "none"),
+          nrow = 2,
+          ncol = 2,
+          labels = c("(a)", "(b)", "(c)", "(d)"))
+
+
+# save figure as pdf
+figS5_name <- paste("figures/FigS5_tide-day-night_", Sys.Date(),".pdf", sep = "")
+ggsave(figS5_name, tide_dvn_figure , height = 10, width = 11, dpi = 300)
+
+
+```
+
+```{r figure 4 - location}
+# Calculate alpha diversity and combine with sample data 
+alpha_div_location <-location_sciname %>%
+  estimate_richness(measures = c("Observed", "Shannon")) %>%
+  bind_cols(data.frame(sample_data(location_sciname))[, c("location", "month")]) %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon"),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+# observed richness
+location_richness_plot_obs <- alpha_div_location %>% filter(measure == "Observed") %>% 
+  ggplot(., aes(x = location, y = value)) +
+  geom_boxplot() +
+  ylab("Observed richness") +
+  xlab("Month") +
+  facet_grid(~month, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+# shanon richness
+location_richness_plot_sha <- alpha_div_location %>% filter(measure == "Shannon") %>% 
+  ggplot(., aes(x = location, y = value)) +
+  geom_boxplot() +
+  ylab("Shannon diversity") +
+  xlab("Month") +
+  facet_grid(~month, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+
+# Location
+location_taxa_plot <- relab_location %>% 
+  fixFactorsOrder() %>% 
+  speedyseq::psmelt(.) %>% 
+  addCustomTaxa() %>% 
+  ggplot(., aes(x = location, y = Abundance, fill = custom_taxa)) +
+  facet_wrap(~month) +
+  geom_col(position = "stack") +
+  niceplot +
+  xlab("Location") +
+  ylab("Relative abundance") +
+  theme(legend.position = "right") +
+  scale_fill_manual(values = custom_taxa_all, name = "", guide = guide_legend(nrow = 5)) 
+
+# Figure 4: location ----
+location_1 <- location_richness_plot_obs + theme(axis.title.x = element_blank()) 
+location_2 <- location_richness_plot_sha + theme(axis.title.x = element_blank()) 
+location_3 <- location_taxa_plot + facet_wrap(~month, nrow = 1) + theme(legend.position = "bottom") 
+
+location_fig <- egg::ggarrange(location_1, 
+          location_2,
+          location_3 + theme(legend.justification = c(1, 0)),
+          nrow = 3,
+          ncol = 1,
+          labels = c("(a)", "(b)", "(c)"))
+# save figure as pdf
+fig4_name <- paste("figures/Fig4_location_", Sys.Date(),".pdf", sep = "")
+ggsave(fig4_name, location_fig , height = 11, width = 12, dpi = 300)
+ggsave("figures/Figure_4.tif", location_fig , height = 11, width = 12, dpi = 300)
+
+#----reformat for ICES 
+finishing <- theme(legend.key.size = unit(0.3, 'cm'),
+                   strip.text = element_text(size = 9),
+                   legend.text = element_text(size = 8),
+                   axis.text.x = element_text(size = 9),
+                   axis.text.y = element_text(size = 9),
+                   axis.title.x = element_text(size = 10),
+                   axis.title.y = element_text(size = 10))
+
+location_ices <- egg::ggarrange(location_1 + finishing, 
+          location_2 + finishing,
+          location_3 + finishing + theme(legend.justification = c(1, 0)),
+          nrow = 3,
+          ncol = 1,
+          label.args = list(gp = grid::gpar(fontsize = 10, fontface = "bold")),
+          labels = c("(a)", "(b)", "(c)"))
+
+
+# Calculate the proportional height for a single-column figure
+fig4_width_mm <- 170
+fig4_height_mm <- (170 * 13) / 11
+
+# Save the figure with the new dimensions
+ggsave("figures/Figure_4_ICES.tif", location_ices, 
+       width = fig4_width_mm, 
+       height = fig4_height_mm, 
+       units = "mm", 
+       dpi = 300,
+       compression = "lzw")
+```
+
+```{r figure 5 - temporal}
+# Calculate alpha diversity and combine with sample data 
+alpha_div_temporal <-temporal_sciname %>%
+  estimate_richness(measures = c("Observed", "Shannon")) %>%
+  bind_cols(data.frame(sample_data(temporal_sciname))[, c("year", "month")]) %>%
+  pivot_longer(
+    cols = c("Observed", "Shannon"),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+# Create the richness plot
+temporal_richness_plot <- ggplot(alpha_div_temporal, aes(x = year, y = value)) +
+  geom_boxplot() +
+  ylab("Taxa richness") +
+  xlab("Year") +
+  facet_wrap(~measure, scales = "free_y") +
+  niceplot +
+  theme(legend.position = "right")
+
+
+# taxa plot
+temporal_df <- merged_temporal %>% 
+  phyloseq::transform_sample_counts(., function(x) x / sum(x)) %>% 
+  fixFactorsOrder() %>%
+  speedyseq::psmelt(.) %>% 
+  addPlanktonGroup() %>% 
+  addCustomTaxa()
+
+# phylum taxa plot
+temporal_taxa_plot <- temporal_df %>%
+  filter(plankton_group %in% c("Holoplankton", "Meroplankton")) %>% 
+  ggplot(., aes(x = year, y = Abundance, fill = custom_taxa)) +
+  xlab("Year") +
+  ylab("Relative abundance") +
+  facet_wrap(~ plankton_group, scales = "free_y") +
+  geom_col(position = "stack") +
+  niceplot +
+  theme(legend.position = "right") +
+  scale_fill_manual(values = custom_taxa_all, name = "", guide = guide_legend(nrow = 5)) 
+
+# Figure 6----
+temporal_figure <- egg::ggarrange(temporal_richness_plot +
+                                     theme(axis.text.y = element_text(size = 12, vjust = 0.3)), 
+          temporal_taxa_plot +
+                                     theme(axis.text.y = element_text(size = 12, vjust = 0.3), legend.position = "bottom", legend.justification = c(1, 0)),
+          nrow = 1,
+          ncol = 2,
+          labels = c("(a)", "(b)"))
+
+# save figure as pdf
+fig5_name <- paste("figures/Fig5_temporal_", Sys.Date(),".pdf", sep = "")
+ggsave(fig5_name, temporal_figure , height = 5, width = 12, dpi = 300)
+ggsave("figures/Figure_5.tif", temporal_figure ,height = 5, width = 12, dpi = 300)
+
+#----reformat for ICES 
+finishing <- theme(legend.key.size = unit(0.3, 'cm'),
+                   strip.text = element_text(size = 9),
+                   legend.text = element_text(size = 8),
+                   axis.text.x = element_text(size = 9),
+                   axis.text.y = element_text(size = 9),
+                   axis.title.x = element_text(size = 10),
+                   axis.title.y = element_text(size = 10))
+
+temporal_ices<- egg::ggarrange(temporal_richness_plot +
+                                 finishing +
+                                     theme(axis.text.y = element_text(size = 10, vjust = 0.3)), 
+                                temporal_taxa_plot +
+                                  finishing +
+                                  theme(axis.text.y = element_text(size = 10, vjust = 0.3),
+                                        legend.position = "bottom",
+                                        legend.justification = c(1, 0)),
+          nrow = 1,
+          ncol = 2,
+          label.args = list(gp = grid::gpar(fontsize = 10, fontface = "bold")),
+          labels = c("(a)", "(b)"))
+
+# Calculate the proportional height for a double-column figure
+fig_width_mm <- 170
+fig_height_mm <- (170 * 6) / 12
+
+# Save the figure with the new dimensions
+ggsave("figures/Figure_5_ICES.tif", temporal_ices, 
+       width = fig_width_mm, 
+       height = fig_height_mm, 
+       units = "mm", 
+       dpi = 300,
+       compression = "lzw")
+```
+
